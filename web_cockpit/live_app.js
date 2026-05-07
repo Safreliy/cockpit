@@ -162,6 +162,7 @@ function ingestEvent(event) {
   if (event.type === "load") {
     renderLoad(event.load);
   }
+  if (dragStartX != null) return;
   render();
 }
 
@@ -280,15 +281,17 @@ function renderChart() {
   });
   const hit = chart.querySelector(".plot-hit");
   const brush = chart.querySelector("#chartBrush");
-  hit.addEventListener("pointerdown", (event) => {
+  hit.onpointerdown = (event) => {
+    event.preventDefault();
     const point = svgPoint(event);
     dragStartX = Math.max(x1, Math.min(x2, point.x));
     brush.setAttribute("x", dragStartX);
     brush.setAttribute("width", 0);
     brush.setAttribute("visibility", "visible");
-    chart.setPointerCapture(event.pointerId);
-  });
-  chart.addEventListener("pointermove", (event) => {
+    hit.setPointerCapture(event.pointerId);
+  };
+  chart.onpointermove = (event) => {
+    event.preventDefault();
     const point = svgPoint(event);
     if (dragStartX != null) {
       const currentX = Math.max(x1, Math.min(x2, point.x));
@@ -303,8 +306,9 @@ function renderChart() {
     chartTooltip.style.left = Math.min(point.pageX + 12, window.innerWidth - 190) + "px";
     chartTooltip.style.top = Math.max(point.pageY - 58, 8) + "px";
     chartTooltip.innerHTML = "<strong>" + formatClock(nearest.t) + "</strong><span>" + selectedMetric.label + ": " + formatValue(nearest[selectedMetric.key]) + " " + selectedMetric.unit + "</span>";
-  });
-  chart.addEventListener("pointerup", (event) => {
+  };
+  chart.onpointerup = (event) => {
+    event.preventDefault();
     if (dragStartX == null) return;
     const point = svgPoint(event);
     const endX = Math.max(x1, Math.min(x2, point.x));
@@ -316,11 +320,10 @@ function renderChart() {
       renderChart();
     }
     dragStartX = null;
-  });
-  chart.addEventListener("pointerleave", () => {
+  };
+  chart.onpointerleave = () => {
     chartTooltip.hidden = true;
-    dragStartX = null;
-  });
+  };
 }
 
 function renderMetricsStrip() {
@@ -418,6 +421,7 @@ function selectIncident(id, open) {
 }
 
 function render() {
+  if (dragStartX != null) return;
   renderStatus();
   renderChart();
   renderMetricsStrip();

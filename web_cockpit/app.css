@@ -239,12 +239,17 @@ p {
   position: relative;
   min-height: 330px;
   overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 svg {
   display: block;
   width: 100%;
   height: auto;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
 }
 
 .axis {
