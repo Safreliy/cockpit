@@ -108,7 +108,7 @@ class WhatareyatalkinaboutClient:
     ) -> None:
         self.base_url = (base_url or os.environ.get("AI_AGENT_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
         self.user_id = user_id or os.environ.get("AI_AGENT_USER_ID") or DEFAULT_AGENT_USER_ID
-        self.source = source or os.environ.get("AI_AGENT_SOURCE") or "cockpit"
+        self.source = source or os.environ.get("AI_AGENT_SOURCE") or "web"
         self.timeout = timeout
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None, admin: bool = False) -> dict[str, Any]:
