@@ -26,6 +26,9 @@ let selectedWindow = 900;
 let zoomRange = null;
 let dragStartX = null;
 let showAllOps = false;
+let userSelectedIncident = false;
+let reportRenderedIncidentId = null;
+let reportRenderedVersion = "";
 
 const statusBand = document.getElementById("statusBand");
 const statusLabel = document.getElementById("statusLabel");
@@ -183,7 +186,9 @@ function ingestEvent(event) {
   }
   if (event.type === "incident") {
     const incident = upsertIncident(event.incident);
-    selectedIncidentId = incident.id;
+    if (!selectedIncidentId && !userSelectedIncident) {
+      selectedIncidentId = incident.id;
+    }
   }
   if (event.type === "operational_event") {
     operationalEvents.push(event.event);
@@ -196,7 +201,7 @@ function ingestEvent(event) {
     renderLoad(event.load);
   }
   if (dragStartX != null) return;
-  render();
+  renderForEvent(event.type);
 }
 
 function renderLoad(load) {
@@ -461,9 +466,35 @@ function renderIncidents() {
   });
 }
 
-function renderReport() {
+function incidentReportVersion(incident) {
+  if (!incident) return "";
+  return [
+    incident.id,
+    incident.status,
+    incident.last_seen_at,
+    incident.resolved_at,
+    incident.signal_count,
+    incident.updated_at,
+    incident.investigation?.phase,
+    incident.investigation?.progress,
+    showAllOps ? "all-ops" : "latest-ops"
+  ].join("|");
+}
+
+function renderReport(options = {}) {
   const incident = selectedIncident();
   if (!incident) return;
+  const reportOpen = drawer.classList.contains("open");
+  const version = incidentReportVersion(incident);
+  if (!options.force && reportOpen && reportRenderedIncidentId === incident.id && reportRenderedVersion === version) {
+    return;
+  }
+  const previousScroll = drawer.scrollTop;
+  const selection = window.getSelection();
+  const hasTextSelection = selection && selection.type === "Range";
+  if (!options.force && reportOpen && hasTextSelection) {
+    return;
+  }
   document.getElementById("reportTitle").textContent = incident.type;
   const detector = incident.detector ?? { name: "Unknown detector", engine: "unknown", future_engine: "ml_ready" };
   const evidenceRows = (incident.evidence ?? []).map((item) => (
@@ -508,8 +539,13 @@ function renderReport() {
   if (toggleOps) {
     toggleOps.addEventListener("click", () => {
       showAllOps = !showAllOps;
-      renderReport();
+      renderReport({ force: true });
     });
+  }
+  reportRenderedIncidentId = incident.id;
+  reportRenderedVersion = version;
+  if (!options.force && reportOpen) {
+    drawer.scrollTop = previousScroll;
   }
 }
 
@@ -523,10 +559,19 @@ async function loadIncident(id) {
 
 function selectIncident(id, open) {
   if (selectedIncidentId !== id) showAllOps = false;
+  userSelectedIncident = true;
   selectedIncidentId = id;
-  render();
+  renderStatus();
+  renderChart();
+  renderIncidents();
+  renderReport({ force: true });
   loadIncident(id).then((incident) => {
-    if (incident) render();
+    if (incident) {
+      renderStatus();
+      renderChart();
+      renderIncidents();
+      renderReport({ force: true });
+    }
   });
   if (open) openDrawer();
 }
@@ -538,7 +583,42 @@ function render() {
   renderMetricsStrip();
   renderIncidents();
   renderExperiments();
-  renderReport();
+  renderReport({ force: true });
+}
+
+function renderForEvent(type) {
+  if (dragStartX != null) return;
+  if (type === "telemetry") {
+    renderStatus();
+    renderChart();
+    renderMetricsStrip();
+    return;
+  }
+  if (type === "load") {
+    renderStatus();
+    return;
+  }
+  if (type === "incident") {
+    renderStatus();
+    renderChart();
+    renderIncidents();
+    renderReport();
+    return;
+  }
+  if (type === "signal" || type === "detection") {
+    renderStatus();
+    renderReport();
+    return;
+  }
+  if (type === "experiment") {
+    renderExperiments();
+    return;
+  }
+  if (type === "operational_event") {
+    renderReport();
+    return;
+  }
+  render();
 }
 
 async function postJson(url, payload) {
@@ -555,7 +635,7 @@ async function postJson(url, payload) {
 }
 
 function openDrawer() {
-  renderReport();
+  renderReport({ force: true });
   backdrop.hidden = false;
   drawer.classList.add("open");
   drawer.setAttribute("aria-hidden", "false");
@@ -637,7 +717,9 @@ statusActions.forEach((button) => {
     });
     if (data.incident) {
       upsertIncident(data.incident);
-      render();
+      renderStatus();
+      renderIncidents();
+      renderReport({ force: true });
     }
   });
 });
@@ -646,7 +728,11 @@ refreshIncident.addEventListener("click", async () => {
   const incident = selectedIncident();
   if (!incident) return;
   const updated = await loadIncident(incident.id);
-  if (updated) render();
+  if (updated) {
+    renderStatus();
+    renderIncidents();
+    renderReport({ force: true });
+  }
 });
 
 metricPicker.addEventListener("change", () => {
