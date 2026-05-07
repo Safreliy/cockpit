@@ -21,7 +21,13 @@ QUERIES = {
     "read_blocks_rate": 'rate(pg_database_io_cockpit_blks_read{datname="cockpit"}[1m])',
     "cache_hit_rate": 'rate(pg_database_io_cockpit_blks_hit{datname="cockpit"}[1m])',
     "blk_read_time_ms_rate": 'rate(pg_database_io_cockpit_blk_read_time_ms{datname="cockpit"}[1m])',
+    "active_vacuum_sessions": 'pg_vacuum_activity_cockpit_active_vacuum_sessions{datname="cockpit"}',
+    "active_autovacuum_sessions": 'pg_vacuum_activity_cockpit_active_autovacuum_sessions{datname="cockpit"}',
+    "vacuum_max_elapsed_seconds": 'pg_vacuum_activity_cockpit_vacuum_max_elapsed_seconds{datname="cockpit"}',
+    "config_reload_time": "pg_config_reload_cockpit_reload_time_seconds",
 }
+
+SETTINGS_QUERY = "pg_settings_cockpit_info"
 
 
 def query_prometheus(expr: str) -> float:
@@ -39,6 +45,32 @@ def query_prometheus(expr: str) -> float:
     if not result:
         return 0.0
     return float(result[0]["value"][1])
+
+
+def query_prometheus_vector(expr: str) -> list[dict[str, object]]:
+    url = PROMETHEUS + "/api/v1/query?" + urllib.parse.urlencode({"query": expr})
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+        return []
+    return payload.get("data", {}).get("result", [])
+
+
+def query_settings() -> dict[str, dict[str, str]]:
+    settings: dict[str, dict[str, str]] = {}
+    for item in query_prometheus_vector(SETTINGS_QUERY):
+        metric = item.get("metric", {})
+        name = metric.get("name")
+        if not name:
+            continue
+        settings[str(name)] = {
+            "setting": str(metric.get("setting", "")),
+            "unit": str(metric.get("unit", "")),
+            "context": str(metric.get("context", "")),
+            "pending_restart": str(metric.get("pending_restart", "false")),
+        }
+    return settings
 
 
 def classify(point: dict[str, float]) -> list[dict[str, object]]:

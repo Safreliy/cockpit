@@ -5,7 +5,10 @@ const metricDefs = [
   { key: "xact_rate", label: "Transaction rate", unit: "/s" },
   { key: "read_blocks_rate", label: "Read blocks", unit: "/s" },
   { key: "cache_hit_rate", label: "Cache hits", unit: "/s" },
-  { key: "blk_read_time_ms_rate", label: "Read time", unit: "ms/s", threshold: 50 }
+  { key: "blk_read_time_ms_rate", label: "Read time", unit: "ms/s", threshold: 50 },
+  { key: "active_vacuum_sessions", label: "Manual VACUUM", unit: "", threshold: 1 },
+  { key: "active_autovacuum_sessions", label: "Autovacuum", unit: "", threshold: 1 },
+  { key: "vacuum_max_elapsed_seconds", label: "VACUUM duration", unit: "s", threshold: 30 }
 ];
 
 const API_BASE = location.protocol === "file:" ? "http://127.0.0.1:8088" : "";
@@ -13,6 +16,7 @@ const API_BASE = location.protocol === "file:" ? "http://127.0.0.1:8088" : "";
 let stream = [];
 let detections = [];
 let incidents = [];
+let operationalEvents = [];
 let selectedMetric = metricDefs.find((metric) => metric.key === "xact_rate");
 let selectedIncidentId = null;
 let selectedWindow = 900;
@@ -137,6 +141,7 @@ function ingestSnapshot(snapshot) {
   stream = snapshot.stream ?? [];
   detections = (snapshot.detections ?? []).map(normalizeDetection);
   incidents = (snapshot.incidents ?? []).map(normalizeIncident);
+  operationalEvents = snapshot.operational_events ?? [];
   renderLoad(snapshot.load);
   retentionState.textContent = `${snapshot.retention?.telemetry_points ?? stream.length} pts`;
   render();
@@ -158,6 +163,10 @@ function ingestEvent(event) {
   if (event.type === "incident") {
     const incident = upsertIncident(event.incident);
     selectedIncidentId = incident.id;
+  }
+  if (event.type === "operational_event") {
+    operationalEvents.push(event.event);
+    operationalEvents = operationalEvents.slice(-300);
   }
   if (event.type === "load") {
     renderLoad(event.load);
@@ -328,7 +337,7 @@ function renderChart() {
 
 function renderMetricsStrip() {
   const point = stream.at(-1) ?? {};
-  const primary = ["active_connections", "waiting_connections", "xact_rate", "read_blocks_rate"];
+  const primary = ["active_connections", "waiting_connections", "xact_rate", "vacuum_max_elapsed_seconds"];
   metricsStrip.innerHTML = "";
   primary.forEach((key) => {
     const def = metricDefs.find((metric) => metric.key === key);
@@ -384,6 +393,9 @@ function renderReport() {
   const chain = (incident.causal_chain ?? []).map((item) => (
     '<div class="chain-step done"><span>' + item.stage + '</span><strong>' + item.label + '</strong><small>' + item.detail + '</small></div>'
   )).join("");
+  const relatedOps = (incident.operational_events ?? operationalEvents.slice(-5)).map((item) => (
+    '<li><strong>' + item.type + '</strong><span>' + formatClock(item.t) + ' - ' + item.summary + '</span></li>'
+  )).join("");
   const investigation = incident.investigation ?? {};
   const investigationSteps = (investigation.steps ?? []).map((item) => (
     '<li class="investigation-step ' + item.status + '"><span class="status-pill">' + item.status + '</span><div><strong>' + item.label + '</strong><p>' + item.detail + '</p></div></li>'
@@ -399,6 +411,7 @@ function renderReport() {
     '<div class="report-block"><strong>Interpretation</strong><p>' + incident.summary + '</p></div>' +
     '<div class="report-block"><strong>Causal chain draft</strong><div class="chain">' + chain + '</div></div>' +
     '<div class="report-block"><strong>Competing hypotheses</strong><div class="hypothesis-list">' + hypotheses + '</div></div>' +
+    '<div class="report-block"><strong>DBA and maintenance context</strong><ol class="ops-list">' + (relatedOps || '<li><span>No config reload, pg_settings change, or long VACUUM event near this incident yet.</span></li>') + '</ol></div>' +
     '<div class="report-block"><strong>Evidence</strong><table class="report-table"><thead><tr><th>Metric</th><th>Value</th><th>Comparator</th></tr></thead><tbody>' + evidenceRows + '</tbody></table></div>' +
     '<div class="report-block"><strong>Next actions</strong><ul class="next-actions">' + nextActions + '</ul></div>';
 }

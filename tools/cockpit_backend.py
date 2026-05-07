@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from live_pg_monitor import QUERIES, query_prometheus
+from live_pg_monitor import QUERIES, query_prometheus, query_settings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +62,19 @@ DETECTORS: list[dict[str, Any]] = [
         "summary": "Block read time is rising; possible storage pressure.",
         "candidate_root": "storage_read_pressure",
     },
+    {
+        "id": "rules.postgres.vacuum_pressure.v1",
+        "name": "Vacuum pressure detector",
+        "engine": "rules",
+        "future_engine": "ml_ready",
+        "type": "vacuum_pressure",
+        "metric": "vacuum_max_elapsed_seconds",
+        "operator": ">=",
+        "threshold": 30,
+        "severity": "warning",
+        "summary": "A long-running VACUUM is active and may be competing for IO or locks.",
+        "candidate_root": "manual_or_autovacuum_resource_pressure",
+    },
 ]
 
 
@@ -78,6 +91,8 @@ def build_hypotheses(detection: dict[str, Any], point: dict[str, float]) -> list
     waiting = point.get("waiting_connections", 0)
     read_time = point.get("blk_read_time_ms_rate", 0)
     read_blocks = point.get("read_blocks_rate", 0)
+    vacuum_elapsed = point.get("vacuum_max_elapsed_seconds", 0)
+    vacuum_sessions = point.get("active_vacuum_sessions", 0) + point.get("active_autovacuum_sessions", 0)
     if kind == "high_concurrency":
         return [
             {
@@ -102,6 +117,19 @@ def build_hypotheses(detection: dict[str, Any], point: dict[str, float]) -> list
                 "cause": "downstream_resource_saturation",
                 "score": 0.58 if read_time >= 50 else 0.34,
                 "why": "Waits can be amplified by IO pressure or saturated database workers.",
+            },
+        ]
+    if kind == "vacuum_pressure":
+        return [
+            {
+                "cause": "manual_vacuum_or_autovacuum_overlap",
+                "score": 0.8 if vacuum_elapsed >= 30 else 0.42,
+                "why": "VACUUM is active during the incident window and can compete for IO, locks, and buffer cache.",
+            },
+            {
+                "cause": "maintenance_window_misconfiguration",
+                "score": 0.58 if vacuum_sessions > 0 else 0.25,
+                "why": "Maintenance work appears during foreground workload; check DBA operations and autovacuum settings.",
             },
         ]
     return [
@@ -212,6 +240,10 @@ def evaluate_detectors(point: dict[str, float]) -> list[dict[str, Any]]:
                 {"metric": "active_connections", "value": point.get("active_connections", 0), "role": "context"},
                 {"metric": "waiting_connections", "value": point.get("waiting_connections", 0), "role": "context"},
                 {"metric": "blk_read_time_ms_rate", "value": point.get("blk_read_time_ms_rate", 0), "role": "context"},
+                {"metric": "active_vacuum_sessions", "value": point.get("active_vacuum_sessions", 0), "role": "operational_context"},
+                {"metric": "active_autovacuum_sessions", "value": point.get("active_autovacuum_sessions", 0), "role": "operational_context"},
+                {"metric": "vacuum_max_elapsed_seconds", "value": point.get("vacuum_max_elapsed_seconds", 0), "role": "operational_context"},
+                {"metric": "config_reload_time", "value": point.get("config_reload_time", 0), "role": "operational_context"},
             ],
         }
         detection["hypotheses"] = build_hypotheses(detection, point)
@@ -225,6 +257,9 @@ class TelemetryStore:
         self.points: deque[dict[str, float]] = deque(maxlen=max_points)
         self.detections: deque[dict[str, Any]] = deque(maxlen=max_detections)
         self.incidents: deque[dict[str, Any]] = deque(maxlen=max_detections)
+        self.operational_events: deque[dict[str, Any]] = deque(maxlen=300)
+        self.settings: dict[str, dict[str, str]] = {}
+        self.last_config_reload_time: float | None = None
         self.active_by_type: dict[str, str] = {}
         self.clients: list[queue.Queue[dict[str, Any]]] = []
         self.lock = threading.Lock()
@@ -254,9 +289,70 @@ class TelemetryStore:
             for event in events:
                 self._publish_locked(event)
 
+    def add_settings_snapshot(self, settings: dict[str, dict[str, str]], observed_at: int) -> None:
+        events: list[dict[str, Any]] = []
+        with self.lock:
+            if not self.settings:
+                self.settings = settings
+                return
+            for name, current in settings.items():
+                previous = self.settings.get(name)
+                if previous and previous.get("setting") != current.get("setting"):
+                    event = {
+                        "id": f"op-config-{name}-{observed_at}",
+                        "t": observed_at,
+                        "type": "postgres_config_changed",
+                        "severity": "info",
+                        "summary": f"PostgreSQL setting {name} changed from {previous.get('setting')} to {current.get('setting')}.",
+                        "setting": name,
+                        "previous": previous,
+                        "current": current,
+                    }
+                    self.operational_events.append(event)
+                    events.append({"type": "operational_event", "event": event})
+            self.settings = settings
+            for event in events:
+                self._publish_locked(event)
+
+    def add_operational_events_from_point(self, point: dict[str, float]) -> None:
+        observed_at = int(point["t"])
+        events: list[dict[str, Any]] = []
+        reload_time = point.get("config_reload_time", 0)
+        with self.lock:
+            if reload_time and self.last_config_reload_time and reload_time != self.last_config_reload_time:
+                event = {
+                    "id": f"op-config-reload-{observed_at}",
+                    "t": observed_at,
+                    "type": "postgres_config_reloaded",
+                    "severity": "info",
+                    "summary": "PostgreSQL configuration was reloaded.",
+                    "value": reload_time,
+                }
+                self.operational_events.append(event)
+                events.append({"type": "operational_event", "event": event})
+            if reload_time:
+                self.last_config_reload_time = reload_time
+            if point.get("vacuum_max_elapsed_seconds", 0) >= 30:
+                event = {
+                    "id": f"op-vacuum-{observed_at}",
+                    "t": observed_at,
+                    "type": "postgres_vacuum_active",
+                    "severity": "warning",
+                    "summary": "Long-running VACUUM activity is visible during telemetry polling.",
+                    "active_vacuum_sessions": point.get("active_vacuum_sessions", 0),
+                    "active_autovacuum_sessions": point.get("active_autovacuum_sessions", 0),
+                    "vacuum_max_elapsed_seconds": point.get("vacuum_max_elapsed_seconds", 0),
+                }
+                if not self.operational_events or self.operational_events[-1].get("type") != event["type"]:
+                    self.operational_events.append(event)
+                    events.append({"type": "operational_event", "event": event})
+            for event in events:
+                self._publish_locked(event)
+
     def upsert_incident_locked(self, detection: dict[str, Any]) -> dict[str, Any]:
         incident_id = self.active_by_type.get(detection["type"])
         incident = next((item for item in self.incidents if item["id"] == incident_id), None)
+        related_events = self.related_operational_events_locked(detection["t"])
         if incident is None:
             investigation = build_investigation(detection, 1)
             incident = {
@@ -275,6 +371,7 @@ class TelemetryStore:
                 "confidence": detection["confidence"],
                 "detector": detection["detector"],
                 "evidence": detection["evidence"],
+                "operational_events": related_events,
                 "hypotheses": detection["hypotheses"],
                 "causal_chain": detection["causal_chain"],
                 "investigation": investigation,
@@ -300,12 +397,20 @@ class TelemetryStore:
                 "confidence": detection["confidence"],
                 "detector": detection["detector"],
                 "evidence": detection["evidence"],
+                "operational_events": related_events,
                 "hypotheses": detection["hypotheses"],
                 "causal_chain": detection["causal_chain"],
                 "investigation": investigation,
             }
         )
         return incident
+
+    def related_operational_events_locked(self, incident_time: int, window_seconds: int = 900) -> list[dict[str, Any]]:
+        return [
+            event
+            for event in self.operational_events
+            if abs(int(event.get("t", 0)) - incident_time) <= window_seconds
+        ][-20:]
 
     def get_incident(self, incident_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -347,6 +452,8 @@ class TelemetryStore:
                 "stream": list(self.points),
                 "detections": list(self.detections),
                 "incidents": list(self.incidents),
+                "operational_events": list(self.operational_events),
+                "settings": self.settings,
                 "detectors": DETECTORS,
                 "load": self.load_status_locked(),
                 "retention": {
@@ -483,6 +590,8 @@ def poll_prometheus(store: TelemetryStore, interval: float, stop: threading.Even
             for name, expr in QUERIES.items():
                 point[name] = round(query_prometheus(expr), 3)
             store.add_point(point)
+            store.add_operational_events_from_point(point)
+            store.add_settings_snapshot(query_settings(), now)
         except Exception as error:
             print(f"telemetry poll failed: {error}", flush=True)
         stop.wait(interval)

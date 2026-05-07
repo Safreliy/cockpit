@@ -767,6 +767,33 @@ svg {
   line-height: 1.55;
 }
 
+.ops-list {
+  list-style: none;
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+}
+
+.ops-list li {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-muted);
+  padding: 10px;
+}
+
+.ops-list strong,
+.ops-list span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.ops-list span {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 4px;
+}
+
 .report-table {
   width: 100%;
   border-collapse: collapse;
