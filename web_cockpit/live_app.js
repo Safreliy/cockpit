@@ -15,6 +15,9 @@ let detections = [];
 let incidents = [];
 let selectedMetric = metricDefs.find((metric) => metric.key === "xact_rate");
 let selectedIncidentId = null;
+let selectedWindow = 900;
+let zoomRange = null;
+let dragStartX = null;
 
 const statusBand = document.getElementById("statusBand");
 const statusLabel = document.getElementById("statusLabel");
@@ -23,7 +26,11 @@ const sampleCount = document.getElementById("sampleCount");
 const loadState = document.getElementById("loadState");
 const retentionState = document.getElementById("retentionState");
 const metricPicker = document.getElementById("metricPicker");
+const windowPicker = document.getElementById("windowPicker");
+const resetZoom = document.getElementById("resetZoom");
+const chartRange = document.getElementById("chartRange");
 const chart = document.getElementById("liveChart");
+const chartTooltip = document.getElementById("chartTooltip");
 const metricsStrip = document.getElementById("metricsStrip");
 const incidentSteps = document.getElementById("incidentSteps");
 const startLoad = document.getElementById("startLoad");
@@ -50,9 +57,39 @@ function formatClock(epochSeconds) {
   return new Date(epochSeconds * 1000).toLocaleTimeString();
 }
 
+function formatRangeLabel(firstT, lastT) {
+  if (!firstT || !lastT) return "Waiting for telemetry";
+  return `${new Date(firstT * 1000).toLocaleString()} - ${new Date(lastT * 1000).toLocaleTimeString()}`;
+}
+
 function scale(value, min, max, outMin, outMax) {
   if (max === min) return (outMin + outMax) / 2;
   return outMin + ((value - min) * (outMax - outMin)) / (max - min);
+}
+
+function unscale(value, inMin, inMax, outMin, outMax) {
+  if (inMax === inMin) return (outMin + outMax) / 2;
+  return outMin + ((value - inMin) * (outMax - outMin)) / (inMax - inMin);
+}
+
+function svgPoint(event) {
+  const rect = chart.getBoundingClientRect();
+  return {
+    x: ((event.clientX - rect.left) / rect.width) * 860,
+    y: ((event.clientY - rect.top) / rect.height) * 320,
+    pageX: event.clientX,
+    pageY: event.clientY
+  };
+}
+
+function visibleStreamForChart() {
+  if (!stream.length) return [];
+  if (zoomRange) {
+    return stream.filter((point) => point.t >= zoomRange[0] && point.t <= zoomRange[1]);
+  }
+  if (selectedWindow === "all") return stream;
+  const lastT = stream.at(-1).t;
+  return stream.filter((point) => point.t >= lastT - Number(selectedWindow));
 }
 
 function selectedIncident() {
@@ -160,16 +197,22 @@ function renderStatus() {
 function renderChart() {
   const width = 860;
   const height = 320;
-  const margin = { left: 52, right: 20, top: 24, bottom: 38 };
+  const margin = { left: 58, right: 24, top: 30, bottom: 48 };
   const x1 = margin.left;
   const x2 = width - margin.right;
   const y1 = height - margin.bottom;
   const y2 = margin.top;
   if (!stream.length) {
     chart.innerHTML = '<rect width="860" height="320" fill="#fff"></rect><text x="52" y="160" fill="#607080">Waiting for telemetry...</text>';
+    chartRange.textContent = "Waiting for telemetry";
     return;
   }
-  const visibleStream = stream.slice(-180);
+  const visibleStream = visibleStreamForChart();
+  if (!visibleStream.length) {
+    zoomRange = null;
+    renderChart();
+    return;
+  }
   const values = visibleStream.map((point) => point[selectedMetric.key] ?? 0);
   const threshold = selectedMetric.threshold;
   const min = Math.min(...values, threshold ?? Infinity);
@@ -179,6 +222,8 @@ function renderChart() {
   const yMax = max + span * 0.12;
   const firstT = visibleStream[0].t;
   const lastT = visibleStream.at(-1).t;
+  chartRange.textContent = formatRangeLabel(firstT, lastT);
+  resetZoom.disabled = !zoomRange;
   const points = visibleStream
     .map((point) => {
       const x = scale(point.t, firstT, lastT, x1, x2);
@@ -186,6 +231,17 @@ function renderChart() {
       return x.toFixed(1) + "," + y.toFixed(1);
     })
     .join(" ");
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+    const value = yMax - (yMax - yMin) * ratio;
+    const y = scale(value, yMin, yMax, y1, y2);
+    return '<line class="grid-line" x1="' + x1 + '" x2="' + x2 + '" y1="' + y + '" y2="' + y + '"></line><text class="tick-label" x="' + (x1 - 8) + '" y="' + (y + 4) + '" text-anchor="end">' + formatValue(value) + '</text>';
+  }).join("");
+  const xTickCount = Math.min(6, Math.max(2, visibleStream.length));
+  const xTicks = Array.from({ length: xTickCount }, (_, index) => {
+    const t = firstT + ((lastT - firstT) * index) / (xTickCount - 1 || 1);
+    const x = scale(t, firstT, lastT, x1, x2);
+    return '<line class="grid-line vertical" x1="' + x + '" x2="' + x + '" y1="' + y2 + '" y2="' + y1 + '"></line><text class="tick-label" x="' + x + '" y="' + (y1 + 24) + '" text-anchor="middle">' + formatClock(t) + '</text>';
+  }).join("");
   const thresholdY = threshold == null ? "" : '<line class="threshold" x1="' + x1 + '" x2="' + x2 + '" y1="' + scale(threshold, yMin, yMax, y1, y2) + '" y2="' + scale(threshold, yMin, yMax, y1, y2) + '"></line>';
   const markers = incidents
     .map((incident) => {
@@ -201,14 +257,18 @@ function renderChart() {
     .join("");
   chart.innerHTML =
     '<rect width="' + width + '" height="' + height + '" fill="#fff"></rect>' +
+    '<rect class="plot-bg" x="' + x1 + '" y="' + y2 + '" width="' + (x2 - x1) + '" height="' + (y1 - y2) + '"></rect>' +
+    yTicks +
+    xTicks +
     '<line class="axis" x1="' + x1 + '" x2="' + x2 + '" y1="' + y1 + '" y2="' + y1 + '"></line>' +
     '<line class="axis" x1="' + x1 + '" x2="' + x1 + '" y1="' + y1 + '" y2="' + y2 + '"></line>' +
     thresholdY +
     '<polyline class="series" points="' + points + '"></polyline>' +
+    '<rect class="plot-hit" x="' + x1 + '" y="' + y2 + '" width="' + (x2 - x1) + '" height="' + (y1 - y2) + '"></rect>' +
     markers +
+    '<rect class="brush" id="chartBrush" x="0" y="' + y2 + '" width="0" height="' + (y1 - y2) + '" visibility="hidden"></rect>' +
     '<text x="' + x1 + '" y="18" fill="#17202a" font-size="13" font-weight="700">' + selectedMetric.label + ": " + formatValue(stream.at(-1)[selectedMetric.key]) + " " + selectedMetric.unit + '</text>' +
-    '<text x="8" y="' + (y2 + 4) + '" fill="#607080" font-size="12">' + formatValue(yMax) + '</text>' +
-    '<text x="8" y="' + y1 + '" fill="#607080" font-size="12">' + formatValue(yMin) + '</text>';
+    '<text class="axis-title" x="' + ((x1 + x2) / 2) + '" y="' + (height - 8) + '" text-anchor="middle">time</text>';
   chart.querySelectorAll(".incident-marker").forEach((marker) => {
     marker.addEventListener("click", () => selectIncident(marker.dataset.incidentId, true));
     marker.addEventListener("keydown", (event) => {
@@ -217,6 +277,49 @@ function renderChart() {
         selectIncident(marker.dataset.incidentId, true);
       }
     });
+  });
+  const hit = chart.querySelector(".plot-hit");
+  const brush = chart.querySelector("#chartBrush");
+  hit.addEventListener("pointerdown", (event) => {
+    const point = svgPoint(event);
+    dragStartX = Math.max(x1, Math.min(x2, point.x));
+    brush.setAttribute("x", dragStartX);
+    brush.setAttribute("width", 0);
+    brush.setAttribute("visibility", "visible");
+    chart.setPointerCapture(event.pointerId);
+  });
+  chart.addEventListener("pointermove", (event) => {
+    const point = svgPoint(event);
+    if (dragStartX != null) {
+      const currentX = Math.max(x1, Math.min(x2, point.x));
+      brush.setAttribute("x", Math.min(dragStartX, currentX));
+      brush.setAttribute("width", Math.abs(currentX - dragStartX));
+      return;
+    }
+    const boundedX = Math.max(x1, Math.min(x2, point.x));
+    const t = unscale(boundedX, x1, x2, firstT, lastT);
+    const nearest = visibleStream.reduce((best, item) => Math.abs(item.t - t) < Math.abs(best.t - t) ? item : best, visibleStream[0]);
+    chartTooltip.hidden = false;
+    chartTooltip.style.left = Math.min(point.pageX + 12, window.innerWidth - 190) + "px";
+    chartTooltip.style.top = Math.max(point.pageY - 58, 8) + "px";
+    chartTooltip.innerHTML = "<strong>" + formatClock(nearest.t) + "</strong><span>" + selectedMetric.label + ": " + formatValue(nearest[selectedMetric.key]) + " " + selectedMetric.unit + "</span>";
+  });
+  chart.addEventListener("pointerup", (event) => {
+    if (dragStartX == null) return;
+    const point = svgPoint(event);
+    const endX = Math.max(x1, Math.min(x2, point.x));
+    brush.setAttribute("visibility", "hidden");
+    if (Math.abs(endX - dragStartX) > 24) {
+      const left = Math.min(dragStartX, endX);
+      const right = Math.max(dragStartX, endX);
+      zoomRange = [unscale(left, x1, x2, firstT, lastT), unscale(right, x1, x2, firstT, lastT)];
+      renderChart();
+    }
+    dragStartX = null;
+  });
+  chart.addEventListener("pointerleave", () => {
+    chartTooltip.hidden = true;
+    dragStartX = null;
   });
 }
 
@@ -394,6 +497,15 @@ refreshIncident.addEventListener("click", async () => {
 
 metricPicker.addEventListener("change", () => {
   selectedMetric = metricDefs.find((metric) => metric.key === metricPicker.value);
+  renderChart();
+});
+windowPicker.addEventListener("change", () => {
+  selectedWindow = windowPicker.value === "all" ? "all" : Number(windowPicker.value);
+  zoomRange = null;
+  renderChart();
+});
+resetZoom.addEventListener("click", () => {
+  zoomRange = null;
   renderChart();
 });
 openReport.addEventListener("click", openDrawer);

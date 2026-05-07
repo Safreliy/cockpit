@@ -51,10 +51,21 @@
             <h2>Streaming metrics</h2>
             <p>Telemetry is supporting evidence for incident investigation.</p>
           </div>
-          <select id="metricPicker" aria-label="metric"></select>
+          <div class="chart-controls">
+            <select id="metricPicker" aria-label="metric"></select>
+            <select id="windowPicker" aria-label="time window">
+              <option value="300">5 min</option>
+              <option value="900" selected>15 min</option>
+              <option value="1800">30 min</option>
+              <option value="all">All</option>
+            </select>
+            <button id="resetZoom" type="button" disabled>Reset zoom</button>
+          </div>
         </div>
+        <div class="chart-range" id="chartRange">Waiting for telemetry</div>
         <div class="chart-frame">
           <svg id="liveChart" viewBox="0 0 860 320" role="img" aria-label="live postgres telemetry chart"></svg>
+          <div class="chart-tooltip" id="chartTooltip" hidden></div>
         </div>
       </div>
 

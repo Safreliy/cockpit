@@ -222,7 +222,21 @@ p {
   display: block;
 }
 
+.chart-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.chart-range {
+  margin: -4px 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .chart-frame {
+  position: relative;
   min-height: 330px;
   overflow: hidden;
 }
@@ -238,21 +252,73 @@ svg {
   stroke-width: 1;
 }
 
+.axis-title,
+.tick-label {
+  fill: #607080;
+  font-size: 11px;
+}
+
 .grid-line {
   stroke: #eef1f5;
   stroke-width: 1;
+}
+
+.grid-line.vertical {
+  stroke-dasharray: 2 5;
+}
+
+.plot-bg {
+  fill: #fbfcfe;
+}
+
+.plot-hit {
+  fill: transparent;
+  cursor: crosshair;
 }
 
 .series {
   fill: none;
   stroke: var(--blue);
   stroke-width: 3;
+  stroke-linejoin: round;
+  stroke-linecap: round;
 }
 
 .threshold {
   stroke: var(--warn);
   stroke-width: 1.5;
   stroke-dasharray: 5 5;
+}
+
+.brush {
+  fill: rgba(35, 100, 170, 0.16);
+  stroke: rgba(35, 100, 170, 0.55);
+  stroke-width: 1;
+}
+
+.chart-tooltip {
+  position: fixed;
+  z-index: 5;
+  min-width: 170px;
+  max-width: 220px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 10px 30px rgba(23, 32, 42, 0.16);
+  padding: 9px 10px;
+  pointer-events: none;
+}
+
+.chart-tooltip strong,
+.chart-tooltip span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.chart-tooltip span {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .cursor {
