@@ -43,6 +43,10 @@ DETECTORS: list[dict[str, Any]] = [
         "metric": "active_connections",
         "operator": ">=",
         "threshold": 24,
+        "recover_threshold": 18,
+        "confirmations": 2,
+        "recovery_samples": 3,
+        "cooldown_seconds": 120,
         "severity": "warning",
         "summary": "Active database concurrency is elevated.",
         "candidate_root": "workload_concurrency_spike",
@@ -56,6 +60,10 @@ DETECTORS: list[dict[str, Any]] = [
         "metric": "waiting_connections",
         "operator": ">=",
         "threshold": 2,
+        "recover_threshold": 0,
+        "confirmations": 2,
+        "recovery_samples": 3,
+        "cooldown_seconds": 120,
         "severity": "warning",
         "summary": "Postgres sessions are waiting; inspect locks, IO, and concurrent workload.",
         "candidate_root": "lock_or_resource_contention",
@@ -69,6 +77,10 @@ DETECTORS: list[dict[str, Any]] = [
         "metric": "blk_read_time_ms_rate",
         "operator": ">=",
         "threshold": 50,
+        "recover_threshold": 20,
+        "confirmations": 2,
+        "recovery_samples": 3,
+        "cooldown_seconds": 180,
         "severity": "critical",
         "summary": "Block read time is rising; possible storage pressure.",
         "candidate_root": "storage_read_pressure",
@@ -82,6 +94,10 @@ DETECTORS: list[dict[str, Any]] = [
         "metric": "vacuum_max_elapsed_seconds",
         "operator": ">=",
         "threshold": 30,
+        "recover_threshold": 5,
+        "confirmations": 1,
+        "recovery_samples": 3,
+        "cooldown_seconds": 120,
         "severity": "warning",
         "summary": "A long-running VACUUM is active and may be competing for IO or locks.",
         "candidate_root": "manual_or_autovacuum_resource_pressure",
@@ -223,23 +239,41 @@ def build_investigation(detection: dict[str, Any], sample_count: int = 1) -> dic
     }
 
 
-def evaluate_detectors(point: dict[str, float]) -> list[dict[str, Any]]:
-    detections: list[dict[str, Any]] = []
+def signal_score(value: float, threshold: float) -> float:
+    if threshold <= 0:
+        return 0.5
+    return round(min(1.0, max(0.1, value / threshold)), 2)
+
+
+def signal_fingerprint(signal_type: str, entity: str = "postgres:cockpit") -> str:
+    return f"{entity}:{signal_type}"
+
+
+def evaluate_detectors(point: dict[str, float], history: list[dict[str, float]] | None = None) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
     for detector in DETECTORS:
         value = point.get(detector["metric"], 0)
         threshold = detector["threshold"]
         if value < threshold:
             continue
-        detection = {
+        signal = {
+            "id": f"sig-{detector['type']}-{int(point['t'])}",
             "t": int(point["t"]),
             "type": detector["type"],
+            "fingerprint": signal_fingerprint(detector["type"]),
             "severity": detector["severity"],
             "metric": detector["metric"],
             "value": value,
             "threshold": threshold,
+            "recover_threshold": detector["recover_threshold"],
+            "confirmations": detector["confirmations"],
+            "recovery_samples": detector["recovery_samples"],
+            "cooldown_seconds": detector["cooldown_seconds"],
             "summary": detector["summary"],
             "candidate_root": detector["candidate_root"],
             "confidence": detection_confidence(value, threshold),
+            "score": signal_score(value, threshold),
+            "source": "threshold_detector",
             "detector": {
                 "id": detector["id"],
                 "name": detector["name"],
@@ -257,22 +291,84 @@ def evaluate_detectors(point: dict[str, float]) -> list[dict[str, Any]]:
                 {"metric": "config_reload_time", "value": point.get("config_reload_time", 0), "role": "operational_context"},
             ],
         }
-        detection["hypotheses"] = build_hypotheses(detection, point)
-        detection["causal_chain"] = build_causal_chain(detection)
-        detections.append(detection)
-    return detections
+        signal["hypotheses"] = build_hypotheses(signal, point)
+        signal["causal_chain"] = build_causal_chain(signal)
+        signals.append(signal)
+    signals.extend(evaluate_baseline_signals(point, history or []))
+    return signals
+
+
+def evaluate_baseline_signals(point: dict[str, float], history: list[dict[str, float]]) -> list[dict[str, Any]]:
+    if len(history) < 12:
+        return []
+    baseline_window = history[-30:]
+    xact_values = [item.get("xact_rate", 0) for item in baseline_window]
+    avg_xact = sum(xact_values) / len(xact_values)
+    if avg_xact <= 10:
+        return []
+    current = point.get("xact_rate", 0)
+    if current >= avg_xact * 0.45:
+        return []
+    signal = {
+        "id": f"sig-throughput_drop-{int(point['t'])}",
+        "t": int(point["t"]),
+        "type": "throughput_drop",
+        "fingerprint": signal_fingerprint("throughput_drop"),
+        "severity": "warning",
+        "metric": "xact_rate",
+        "value": current,
+        "threshold": round(avg_xact * 0.45, 3),
+        "recover_threshold": round(avg_xact * 0.75, 3),
+        "confirmations": 2,
+        "recovery_samples": 4,
+        "cooldown_seconds": 180,
+        "summary": "Transaction throughput dropped significantly versus the recent baseline.",
+        "candidate_root": "workload_stall_or_resource_contention",
+        "confidence": 0.68,
+        "score": round(1 - (current / avg_xact), 2),
+        "source": "baseline_deviation_detector",
+        "detector": {
+            "id": "stats.postgres.throughput_drop.v1",
+            "name": "Throughput baseline detector",
+            "engine": "statistical",
+            "future_engine": "ml_ready",
+        },
+        "evidence": [
+            {"metric": "xact_rate", "value": current, "baseline": round(avg_xact, 3), "role": "baseline_deviation"},
+            {"metric": "active_connections", "value": point.get("active_connections", 0), "role": "context"},
+            {"metric": "waiting_connections", "value": point.get("waiting_connections", 0), "role": "context"},
+            {"metric": "vacuum_max_elapsed_seconds", "value": point.get("vacuum_max_elapsed_seconds", 0), "role": "operational_context"},
+        ],
+    }
+    signal["hypotheses"] = [
+        {
+            "cause": "resource_contention_or_blocking",
+            "score": 0.65,
+            "why": "Throughput fell compared with a recent baseline; waits, IO, VACUUM, and config changes should be checked.",
+        },
+        {
+            "cause": "workload_shape_change",
+            "score": 0.42,
+            "why": "A workload transition can reduce transaction rate without a direct database fault.",
+        },
+    ]
+    signal["causal_chain"] = build_causal_chain(signal)
+    return [signal]
 
 
 class TelemetryStore:
     def __init__(self, max_points: int = 720, max_detections: int = 200) -> None:
         self.points: deque[dict[str, float]] = deque(maxlen=max_points)
         self.detections: deque[dict[str, Any]] = deque(maxlen=max_detections)
+        self.signals: deque[dict[str, Any]] = deque(maxlen=max_detections)
         self.incidents: deque[dict[str, Any]] = deque(maxlen=max_detections)
         self.operational_events: deque[dict[str, Any]] = deque(maxlen=300)
         self.settings: dict[str, dict[str, str]] = {}
         self.experiments: deque[dict[str, Any]] = deque(maxlen=100)
         self.last_config_reload_time: float | None = None
         self.active_by_type: dict[str, str] = {}
+        self.active_by_fingerprint: dict[str, str] = {}
+        self.cooldown_until: dict[str, int] = {}
         self.clients: list[queue.Queue[dict[str, Any]]] = []
         self.lock = threading.Lock()
         self.load_process: subprocess.Popen[str] | None = None
@@ -281,25 +377,52 @@ class TelemetryStore:
 
     def add_point(self, point: dict[str, float]) -> None:
         events: list[dict[str, Any]] = [{"type": "telemetry", "point": point}]
-        detections = evaluate_detectors(point)
-        seen_types = {detection["type"] for detection in detections}
         with self.lock:
+            history = list(self.points)
+            signals = evaluate_detectors(point, history)
+            seen_fingerprints = {signal["fingerprint"] for signal in signals}
             self.points.append(point)
-            for detection in detections:
-                self.detections.append(detection)
-                incident = self.upsert_incident_locked(detection)
-                events.append({"type": "detection", "detection": detection})
-                events.append({"type": "incident", "incident": incident})
+            for signal in signals:
+                self.signals.append(signal)
+                self.detections.append(signal)
+                incident = self.upsert_incident_locked(signal)
+                if incident:
+                    events.append({"type": "detection", "detection": signal})
+                    events.append({"type": "signal", "signal": signal})
+                    events.append({"type": "incident", "incident": incident})
             for incident in self.incidents:
-                if incident["status"] == "open" and incident["type"] not in seen_types:
-                    incident["quiet_samples"] = int(incident.get("quiet_samples", 0)) + 1
-                    if incident["quiet_samples"] >= 3:
-                        incident["status"] = "resolved"
-                        incident["resolved_at"] = int(point["t"])
-                        self.active_by_type.pop(incident["type"], None)
+                if incident["status"] in {"resolved", "false_positive"}:
+                    continue
+                if incident["fingerprint"] not in seen_fingerprints:
+                    updated = self.advance_incident_without_signal_locked(incident, int(point["t"]))
+                    if updated:
                         events.append({"type": "incident", "incident": incident})
             for event in events:
                 self._publish_locked(event)
+
+    def advance_incident_without_signal_locked(self, incident: dict[str, Any], now: int) -> bool:
+        incident["quiet_samples"] = int(incident.get("quiet_samples", 0)) + 1
+        recovery_samples = int(incident.get("recovery_samples", 3))
+        if incident["status"] in {"candidate", "active", "open", "acknowledged"} and incident["quiet_samples"] >= 1:
+            incident["status"] = "recovering"
+            incident["recovering_at"] = incident.get("recovering_at") or now
+            incident["updated_at"] = now
+            incident["consecutive_signal_count"] = 0
+            return True
+        if incident["status"] == "recovering" and incident["quiet_samples"] >= recovery_samples:
+            incident["status"] = "resolved"
+            incident["resolved_at"] = now
+            incident["updated_at"] = now
+            self.active_by_fingerprint.pop(incident["fingerprint"], None)
+            self.active_by_type.pop(incident["type"], None)
+            self.cooldown_until[incident["fingerprint"]] = now + int(incident.get("cooldown_seconds", 120))
+            if incident.get("investigation"):
+                incident["investigation"]["state"] = "complete"
+                incident["investigation"]["phase"] = "resolved"
+                incident["investigation"]["progress"] = 100
+                incident["investigation"]["updated_at"] = now
+            return True
+        return False
 
     def add_settings_snapshot(self, settings: dict[str, dict[str, str]], observed_at: int) -> None:
         events: list[dict[str, Any]] = []
@@ -470,25 +593,40 @@ class TelemetryStore:
             return False
         return all(char.isalnum() or char in "._-" for char in value)
 
-    def upsert_incident_locked(self, detection: dict[str, Any]) -> dict[str, Any]:
-        incident_id = self.active_by_type.get(detection["type"])
+    def upsert_incident_locked(self, detection: dict[str, Any]) -> dict[str, Any] | None:
+        fingerprint = detection["fingerprint"]
+        now = int(detection["t"])
+        incident_id = self.active_by_fingerprint.get(fingerprint)
         incident = next((item for item in self.incidents if item["id"] == incident_id), None)
+        if incident is None and self.cooldown_until.get(fingerprint, 0) > now:
+            return None
         related_events = self.related_operational_events_locked(detection["t"])
         if incident is None:
             investigation = build_investigation(detection, 1)
+            confirmations = int(detection.get("confirmations", 2))
+            status = "active" if confirmations <= 1 else "candidate"
             incident = {
                 "id": f"inc-{detection['type']}-{detection['t']}",
+                "fingerprint": fingerprint,
                 "type": detection["type"],
                 "severity": detection["severity"],
-                "status": "open",
+                "status": status,
                 "created_at": detection["t"],
+                "started_at": detection["t"],
+                "activated_at": detection["t"] if status == "active" else None,
                 "last_seen_at": detection["t"],
                 "quiet_samples": 0,
+                "consecutive_signal_count": 1,
+                "signal_count": 1,
                 "sample_count": 1,
+                "confirmations": confirmations,
+                "recovery_samples": int(detection.get("recovery_samples", 3)),
+                "cooldown_seconds": int(detection.get("cooldown_seconds", 120)),
                 "summary": detection["summary"],
                 "metric": detection["metric"],
                 "value": detection["value"],
                 "threshold": detection["threshold"],
+                "recover_threshold": detection.get("recover_threshold"),
                 "confidence": detection["confidence"],
                 "detector": detection["detector"],
                 "evidence": detection["evidence"],
@@ -496,25 +634,40 @@ class TelemetryStore:
                 "hypotheses": detection["hypotheses"],
                 "causal_chain": detection["causal_chain"],
                 "investigation": investigation,
+                "timeline": [self.signal_timeline_entry(detection)],
                 "notes": [],
             }
             self.incidents.append(incident)
             self.active_by_type[detection["type"]] = incident["id"]
+            self.active_by_fingerprint[fingerprint] = incident["id"]
             return incident
         sample_count = int(incident.get("sample_count", 0)) + 1
+        signal_count = int(incident.get("signal_count", 0)) + 1
+        consecutive_count = int(incident.get("consecutive_signal_count", 0)) + 1
+        status = incident["status"]
+        if status in {"candidate", "recovering"} and consecutive_count >= int(incident.get("confirmations", 2)):
+            status = "active"
+            incident["activated_at"] = incident.get("activated_at") or detection["t"]
+        if status == "resolved":
+            status = "active"
         investigation = build_investigation(detection, sample_count)
         investigation["started_at"] = incident.get("investigation", {}).get("started_at", incident["created_at"])
+        timeline = list(incident.get("timeline", []))
+        timeline.append(self.signal_timeline_entry(detection))
         incident.update(
             {
                 "severity": detection["severity"],
-                "status": "open",
+                "status": status,
                 "last_seen_at": detection["t"],
                 "quiet_samples": 0,
+                "consecutive_signal_count": consecutive_count,
+                "signal_count": signal_count,
                 "sample_count": sample_count,
                 "summary": detection["summary"],
                 "metric": detection["metric"],
                 "value": detection["value"],
                 "threshold": detection["threshold"],
+                "recover_threshold": detection.get("recover_threshold"),
                 "confidence": detection["confidence"],
                 "detector": detection["detector"],
                 "evidence": detection["evidence"],
@@ -522,9 +675,22 @@ class TelemetryStore:
                 "hypotheses": detection["hypotheses"],
                 "causal_chain": detection["causal_chain"],
                 "investigation": investigation,
+                "timeline": timeline[-80:],
             }
         )
         return incident
+
+    def signal_timeline_entry(self, signal: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "t": signal["t"],
+            "type": signal["type"],
+            "source": signal.get("source", "detector"),
+            "metric": signal["metric"],
+            "value": signal["value"],
+            "score": signal.get("score", 0),
+            "confidence": signal.get("confidence", 0),
+            "summary": signal["summary"],
+        }
 
     def related_operational_events_locked(self, incident_time: int, window_seconds: int = 900) -> list[dict[str, Any]]:
         return [
@@ -560,8 +726,11 @@ class TelemetryStore:
                 incident.setdefault("notes", []).append({"t": incident["updated_at"], "text": note})
             if status in {"resolved", "false_positive"}:
                 self.active_by_type.pop(incident["type"], None)
+                self.active_by_fingerprint.pop(incident.get("fingerprint", ""), None)
+                self.cooldown_until[incident.get("fingerprint", "")] = incident["updated_at"] + int(incident.get("cooldown_seconds", 120))
             elif status == "open":
                 self.active_by_type[incident["type"]] = incident["id"]
+                self.active_by_fingerprint[incident.get("fingerprint", incident["type"])] = incident["id"]
             self._publish_locked({"type": "incident", "incident": incident})
             return True, "updated", incident
 
@@ -572,6 +741,7 @@ class TelemetryStore:
                 "generated_at": int(time.time()),
                 "stream": list(self.points),
                 "detections": list(self.detections),
+                "signals": list(self.signals),
                 "incidents": list(self.incidents),
                 "operational_events": list(self.operational_events),
                 "settings": self.settings,
@@ -582,6 +752,7 @@ class TelemetryStore:
                 "retention": {
                     "telemetry_points": self.points.maxlen,
                     "detections": self.detections.maxlen,
+                    "signals": self.signals.maxlen,
                     "incidents": self.incidents.maxlen,
                     "disk_policy": "backend keeps rolling memory only; Prometheus retention is configured in infra/docker-compose.yml",
                 },

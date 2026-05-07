@@ -15,6 +15,7 @@ const API_BASE = location.protocol === "file:" ? "http://127.0.0.1:8088" : "";
 
 let stream = [];
 let detections = [];
+let signals = [];
 let incidents = [];
 let operationalEvents = [];
 let experiments = [];
@@ -24,6 +25,7 @@ let selectedIncidentId = null;
 let selectedWindow = 900;
 let zoomRange = null;
 let dragStartX = null;
+let showAllOps = false;
 
 const statusBand = document.getElementById("statusBand");
 const statusLabel = document.getElementById("statusLabel");
@@ -107,7 +109,8 @@ function visibleStreamForChart() {
 }
 
 function selectedIncident() {
-  return incidents.find((item) => item.id === selectedIncidentId) ?? incidents.find((item) => item.status === "open") ?? incidents.at(-1) ?? null;
+  const activeStatuses = new Set(["candidate", "active", "recovering", "acknowledged", "open"]);
+  return incidents.find((item) => item.id === selectedIncidentId) ?? incidents.find((item) => activeStatuses.has(item.status)) ?? incidents.at(-1) ?? null;
 }
 
 function renderMetricPicker() {
@@ -150,6 +153,7 @@ function upsertIncident(incident) {
 function ingestSnapshot(snapshot) {
   stream = snapshot.stream ?? [];
   detections = (snapshot.detections ?? []).map(normalizeDetection);
+  signals = (snapshot.signals ?? snapshot.detections ?? []).map(normalizeDetection);
   incidents = (snapshot.incidents ?? []).map(normalizeIncident);
   operationalEvents = snapshot.operational_events ?? [];
   experiments = snapshot.experiments ?? [];
@@ -172,6 +176,10 @@ function ingestEvent(event) {
   if (event.type === "detection") {
     detections.push(normalizeDetection(event.detection));
     detections = detections.slice(-200);
+  }
+  if (event.type === "signal") {
+    signals.push(normalizeDetection(event.signal));
+    signals = signals.slice(-200);
   }
   if (event.type === "incident") {
     const incident = upsertIncident(event.incident);
@@ -205,7 +213,8 @@ function renderLoad(load) {
 function renderStatus() {
   sampleCount.textContent = String(stream.length);
   const incident = selectedIncident();
-  const openCount = incidents.filter((item) => item.status === "open").length;
+  const openStatuses = new Set(["candidate", "active", "recovering", "acknowledged", "open"]);
+  const openCount = incidents.filter((item) => openStatuses.has(item.status)).length;
   statusBand.classList.remove("state-ok", "state-warn", "state-bad");
   if (!openCount) {
     statusBand.classList.add("state-ok");
@@ -216,7 +225,7 @@ function renderStatus() {
   }
   statusBand.classList.add(incident?.severity === "critical" ? "state-bad" : "state-warn");
   statusLabel.textContent = incident.summary;
-  statusSubtitle.textContent = `${openCount} open incident${openCount === 1 ? "" : "s"} - investigation ${incident.investigation?.phase ?? "queued"}`;
+  statusSubtitle.textContent = `${openCount} active incident${openCount === 1 ? "" : "s"} - ${incident.status} / ${incident.investigation?.phase ?? "queued"}`;
   openReport.disabled = false;
 }
 
@@ -274,11 +283,15 @@ function renderChart() {
       const markerT = incident.last_seen_at ?? incident.created_at;
       if (markerT < firstT || markerT > lastT) return "";
       const point = stream.reduce((best, item) => Math.abs(item.t - markerT) < Math.abs(best.t - markerT) ? item : best, stream[0]);
+      const startT = Math.max(incident.started_at ?? incident.created_at ?? markerT, firstT);
+      const endT = Math.min(incident.resolved_at ?? incident.last_seen_at ?? markerT, lastT);
+      const bandX = scale(startT, firstT, lastT, x1, x2);
+      const bandWidth = Math.max(8, scale(endT, firstT, lastT, x1, x2) - bandX);
       const x = scale(markerT, firstT, lastT, x1, x2);
       const y = scale(point[selectedMetric.key] ?? 0, yMin, yMax, y1, y2);
       const active = selectedIncident()?.id === incident.id ? " selected" : "";
       const resolved = incident.status === "resolved" || incident.status === "false_positive" ? " resolved" : "";
-      return '<g class="incident-marker' + active + resolved + '" data-incident-id="' + incident.id + '" role="button" tabindex="0"><rect class="incident-band" x="' + (x - 12) + '" y="' + y2 + '" width="24" height="' + (y1 - y2) + '"></rect><line class="anomaly-line" x1="' + x + '" x2="' + x + '" y1="' + y2 + '" y2="' + y1 + '"></line><circle class="anomaly-dot" cx="' + x + '" cy="' + y + '" r="7"></circle><circle class="anomaly-hit" cx="' + x + '" cy="' + y + '" r="18"></circle></g>';
+      return '<g class="incident-marker' + active + resolved + '" data-incident-id="' + incident.id + '" role="button" tabindex="0"><rect class="incident-band" x="' + bandX + '" y="' + y2 + '" width="' + bandWidth + '" height="' + (y1 - y2) + '"></rect><line class="anomaly-line" x1="' + x + '" x2="' + x + '" y1="' + y2 + '" y2="' + y1 + '"></line><circle class="anomaly-dot" cx="' + x + '" cy="' + y + '" r="7"></circle><circle class="anomaly-hit" cx="' + x + '" cy="' + y + '" r="18"></circle></g>';
     })
     .join("");
   chart.innerHTML =
@@ -435,7 +448,7 @@ function renderIncidents() {
     li.setAttribute("tabindex", "0");
     li.innerHTML =
       '<div class="step-head"><strong>' + incident.type + '</strong><span class="status-pill">' + incident.status + "</span></div>" +
-      "<span>" + formatClock(incident.last_seen_at ?? incident.created_at) + " - " + incident.metric + " = " + formatValue(incident.value) + " · conf " + formatValue((incident.confidence ?? 0) * 100) + "%</span>" +
+      "<span>" + formatClock(incident.started_at ?? incident.created_at) + " - " + formatClock(incident.last_seen_at ?? incident.created_at) + " · signals " + (incident.signal_count ?? incident.sample_count ?? 1) + " · conf " + formatValue((incident.confidence ?? 0) * 100) + "%</span>" +
       '<div class="investigation-mini"><span>' + (incident.investigation?.phase ?? "queued") + '</span><div><i style="width:' + (incident.investigation?.progress ?? 0) + '%"></i></div></div>';
     li.addEventListener("click", () => selectIncident(incident.id, true));
     li.addEventListener("keydown", (event) => {
@@ -462,7 +475,10 @@ function renderReport() {
   const chain = (incident.causal_chain ?? []).map((item) => (
     '<div class="chain-step done"><span>' + item.stage + '</span><strong>' + item.label + '</strong><small>' + item.detail + '</small></div>'
   )).join("");
-  const relatedOps = (incident.operational_events ?? operationalEvents.slice(-5)).map((item) => (
+  const allOps = (incident.operational_events ?? operationalEvents).slice().sort((left, right) => (right.t ?? 0) - (left.t ?? 0));
+  const visibleOps = showAllOps ? allOps : allOps.slice(0, 5);
+  const hiddenOpsCount = Math.max(0, allOps.length - visibleOps.length);
+  const relatedOps = visibleOps.map((item) => (
     '<li><strong>' + item.type + '</strong><span>' + formatClock(item.t) + ' - ' + item.summary + '</span></li>'
   )).join("");
   const investigation = incident.investigation ?? {};
@@ -470,8 +486,12 @@ function renderReport() {
     '<li class="investigation-step ' + item.status + '"><span class="status-pill">' + item.status + '</span><div><strong>' + item.label + '</strong><p>' + item.detail + '</p></div></li>'
   )).join("");
   const nextActions = (investigation.next_actions ?? []).map((item) => "<li>" + item + "</li>").join("");
+  const timeline = (incident.timeline ?? []).slice(-12).reverse().map((item) => (
+    '<li><strong>' + item.type + '</strong><span>' + formatClock(item.t) + ' - ' + item.metric + ' = ' + formatValue(item.value) + ' · score ' + formatValue(item.score) + '</span></li>'
+  )).join("");
   document.getElementById("tab-diagnosis").innerHTML =
     '<div class="report-block"><strong>Status</strong><p><span class="status-pill">' + incident.status + "</span> confidence " + formatValue((incident.confidence ?? 0) * 100) + "%</p></div>" +
+    '<div class="report-block"><strong>Incident period</strong><p>' + formatClock(incident.started_at ?? incident.created_at) + " - " + formatClock(incident.resolved_at ?? incident.last_seen_at) + " · signals " + (incident.signal_count ?? 1) + " · fingerprint " + (incident.fingerprint ?? incident.type) + '</p></div>' +
     '<div class="report-block"><strong>Investigation process</strong><div class="investigation-header"><div><span class="status-pill">' + (investigation.state ?? "queued") + '</span><strong>' + (investigation.phase ?? "queued") + '</strong><p>' + (investigation.summary ?? "Waiting for incident evidence.") + '</p></div><div class="progress-ring">' + formatValue(investigation.progress ?? 0) + '%</div></div><ol class="investigation-list">' + investigationSteps + '</ol></div>' +
     '<div class="report-block"><strong>Inference engine</strong><p>' + (investigation.engine?.mode ?? "hybrid_inference") + " · current: " + (investigation.engine?.current ?? "rules") + " · future: " + (investigation.engine?.future ?? "ml_model_or_ai_agent") + '</p></div>' +
     '<div class="report-block"><strong>Detector</strong><p>' + detector.name + " · engine: " + detector.engine + " · future: " + detector.future_engine + '</p></div>' +
@@ -480,9 +500,17 @@ function renderReport() {
     '<div class="report-block"><strong>Interpretation</strong><p>' + incident.summary + '</p></div>' +
     '<div class="report-block"><strong>Causal chain draft</strong><div class="chain">' + chain + '</div></div>' +
     '<div class="report-block"><strong>Competing hypotheses</strong><div class="hypothesis-list">' + hypotheses + '</div></div>' +
-    '<div class="report-block"><strong>DBA and maintenance context</strong><ol class="ops-list">' + (relatedOps || '<li><span>No config reload, pg_settings change, or long VACUUM event near this incident yet.</span></li>') + '</ol></div>' +
+    '<div class="report-block"><strong>Signal timeline</strong><ol class="ops-list">' + (timeline || '<li><span>No signals captured yet.</span></li>') + '</ol></div>' +
+    '<div class="report-block"><div class="report-block-head"><strong>DBA and maintenance context</strong>' + (allOps.length > 5 ? '<button id="toggleOps" type="button">' + (showAllOps ? 'Show latest 5' : 'Show all ' + allOps.length) + '</button>' : '') + '</div><ol class="ops-list">' + (relatedOps || '<li><span>No config reload, pg_settings change, or long VACUUM event near this incident yet.</span></li>') + '</ol>' + (!showAllOps && hiddenOpsCount ? '<p class="ops-summary">' + hiddenOpsCount + ' older events hidden.</p>' : '') + '</div>' +
     '<div class="report-block"><strong>Evidence</strong><table class="report-table"><thead><tr><th>Metric</th><th>Value</th><th>Comparator</th></tr></thead><tbody>' + evidenceRows + '</tbody></table></div>' +
     '<div class="report-block"><strong>Next actions</strong><ul class="next-actions">' + nextActions + '</ul></div>';
+  const toggleOps = document.getElementById("toggleOps");
+  if (toggleOps) {
+    toggleOps.addEventListener("click", () => {
+      showAllOps = !showAllOps;
+      renderReport();
+    });
+  }
 }
 
 async function loadIncident(id) {
@@ -494,6 +522,7 @@ async function loadIncident(id) {
 }
 
 function selectIncident(id, open) {
+  if (selectedIncidentId !== id) showAllOps = false;
   selectedIncidentId = id;
   render();
   loadIncident(id).then((incident) => {

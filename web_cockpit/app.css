@@ -523,6 +523,22 @@ svg {
   border-color: rgba(154, 97, 0, 0.42);
 }
 
+.step.status-candidate {
+  background: #f7f8fa;
+  border-color: var(--line);
+}
+
+.step.status-active,
+.step.status-open {
+  background: #fff8ec;
+  border-color: rgba(154, 97, 0, 0.45);
+}
+
+.step.status-recovering {
+  background: #f4f9ff;
+  border-color: rgba(35, 100, 170, 0.45);
+}
+
 .step.status-resolved,
 .step.status-false_positive {
   background: #f7f8fa;
@@ -774,6 +790,23 @@ svg {
   overflow-wrap: anywhere;
 }
 
+.report-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.report-block-head strong {
+  margin-bottom: 0;
+}
+
+.report-block-head button {
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
 .investigation-header {
   display: flex;
   align-items: center;
@@ -849,6 +882,18 @@ svg {
   gap: 8px;
   margin: 0;
   padding: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.ops-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.ops-list::-webkit-scrollbar-thumb {
+  background: #c8d2dd;
+  border-radius: 999px;
 }
 
 .ops-list li {
@@ -868,6 +913,11 @@ svg {
   color: var(--muted);
   font-size: 13px;
   margin-top: 4px;
+}
+
+.ops-summary {
+  margin-top: 8px;
+  font-size: 12px;
 }
 
 .report-table {
