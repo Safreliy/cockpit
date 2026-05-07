@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
-from cockpit_backend import MLBasedSuspicionDetector, detector_catalog
+from cockpit.detectors import MLBasedSuspicionDetector, detector_catalog
 
 
 def test_detector_catalog_exposes_replaceable_engines():

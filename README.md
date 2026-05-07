@@ -2,16 +2,17 @@
 
 Incident-centric observability cockpit prototype for PostgreSQL telemetry and causal investigation.
 
-The project started as a causal load simulator and now includes a local live stack: PostgreSQL, postgres_exporter, Prometheus, a Python SSE backend, and a browser UI that turns detector output into incidents with investigation progress, hypotheses, evidence, and causal-chain drafts.
+The project started as a causal load simulator and now includes a local live stack: PostgreSQL, postgres_exporter, Prometheus, a Python SSE backend, and a browser UI that turns detector signals into incidents with lifecycle, investigation progress, hypotheses, evidence, and causal-chain drafts.
 
 ## What It Does
 
 - Streams real PostgreSQL telemetry from Prometheus.
 - Starts `pgbench` load from the web UI.
-- Detects anomalies with rule-based detectors.
-- Aggregates raw detections into incidents.
-- Shows incident lifecycle: open, acknowledged, resolved, false positive.
+- Detects suspicious activity through a pluggable detector pipeline: rule-based, statistical, and ML-like stub detectors.
+- Aggregates detector signals into incident periods by fingerprint.
+- Shows incident lifecycle: candidate, active, recovering, resolved, acknowledged, false positive.
 - Displays an investigation process that can later be driven by ML/AI inference.
+- Provides a sandbox-only DBA experiment lab for controlled PostgreSQL setting changes and rollback.
 - Keeps telemetry bounded: backend uses rolling memory buffers, Prometheus has TSDB retention.
 
 ## Quick Start
@@ -57,8 +58,11 @@ python -m pytest
 ## Main Paths
 
 - `tools/cockpit_backend.py` - live backend, SSE, incidents, load control.
+- `tools/cockpit/detectors.py` - detector interface and signal pipeline.
+- `tools/cockpit/experiments.py` - DBA experiment allowlist.
 - `tools/live_pg_monitor.py` - Prometheus query helpers.
 - `web_cockpit/live.html` - live incident cockpit UI.
+- `web_cockpit/index.html` - static simulator replay UI.
 - `infra/docker-compose.yml` - local observability stack.
 - `causal_sim/` - simulator and causal episode generation.
 - `ROADMAP.md` - product and architecture roadmap.
