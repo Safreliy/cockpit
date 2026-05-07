@@ -17,6 +17,8 @@ let stream = [];
 let detections = [];
 let incidents = [];
 let operationalEvents = [];
+let experiments = [];
+let experimentSettings = {};
 let selectedMetric = metricDefs.find((metric) => metric.key === "xact_rate");
 let selectedIncidentId = null;
 let selectedWindow = 900;
@@ -42,10 +44,18 @@ const stopLoad = document.getElementById("stopLoad");
 const loadClients = document.getElementById("loadClients");
 const loadSeconds = document.getElementById("loadSeconds");
 const loadMode = document.getElementById("loadMode");
+const openExperimentLab = document.getElementById("openExperimentLab");
 const openReport = document.getElementById("openReport");
 const drawer = document.getElementById("reportDrawer");
 const backdrop = document.getElementById("drawerBackdrop");
 const closeReport = document.getElementById("closeReport");
+const experimentDrawer = document.getElementById("experimentDrawer");
+const experimentBackdrop = document.getElementById("experimentBackdrop");
+const closeExperimentLab = document.getElementById("closeExperimentLab");
+const experimentSetting = document.getElementById("experimentSetting");
+const experimentValue = document.getElementById("experimentValue");
+const applyExperiment = document.getElementById("applyExperiment");
+const experimentList = document.getElementById("experimentList");
 const statusActions = document.querySelectorAll(".status-action");
 const refreshIncident = document.getElementById("refreshIncident");
 
@@ -142,6 +152,9 @@ function ingestSnapshot(snapshot) {
   detections = (snapshot.detections ?? []).map(normalizeDetection);
   incidents = (snapshot.incidents ?? []).map(normalizeIncident);
   operationalEvents = snapshot.operational_events ?? [];
+  experiments = snapshot.experiments ?? [];
+  experimentSettings = snapshot.experiment_settings ?? {};
+  renderExperimentSettings();
   renderLoad(snapshot.load);
   retentionState.textContent = `${snapshot.retention?.telemetry_points ?? stream.length} pts`;
   render();
@@ -167,6 +180,9 @@ function ingestEvent(event) {
   if (event.type === "operational_event") {
     operationalEvents.push(event.event);
     operationalEvents = operationalEvents.slice(-300);
+  }
+  if (event.type === "experiment") {
+    upsertExperiment(event.experiment);
   }
   if (event.type === "load") {
     renderLoad(event.load);
@@ -349,6 +365,59 @@ function renderMetricsStrip() {
   });
 }
 
+function upsertExperiment(experiment) {
+  const index = experiments.findIndex((item) => item.id === experiment.id);
+  if (index >= 0) {
+    experiments[index] = experiment;
+  } else {
+    experiments.unshift(experiment);
+    experiments = experiments.slice(0, 100);
+  }
+}
+
+function renderExperimentSettings() {
+  const selected = experimentSetting.value;
+  experimentSetting.innerHTML = "";
+  Object.entries(experimentSettings).forEach(([name, meta]) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name + " - " + meta.description;
+    experimentSetting.appendChild(option);
+  });
+  if (selected && experimentSettings[selected]) {
+    experimentSetting.value = selected;
+  }
+  if (!experimentValue.value && experimentSetting.value) {
+    experimentValue.value = experimentSettings[experimentSetting.value]?.risky ?? "";
+  }
+}
+
+function renderExperiments() {
+  experimentList.innerHTML = "";
+  if (!experiments.length) {
+    const empty = document.createElement("li");
+    empty.className = "step empty";
+    empty.innerHTML = "<strong>No experiments yet</strong><span>Apply a controlled setting change to create a DBA-cause signal.</span>";
+    experimentList.appendChild(empty);
+    return;
+  }
+  experiments.forEach((experiment) => {
+    const li = document.createElement("li");
+    li.className = "experiment-item status-" + experiment.status;
+    li.innerHTML =
+      "<div><strong>" + experiment.setting + " = " + experiment.value + "</strong><span>" + experiment.status + " at " + formatClock(experiment.t) + "</span><span>previous: " + (experiment.previous?.setting ?? "--") + "</span></div>" +
+      '<button type="button" data-experiment-id="' + experiment.id + '"' + (experiment.status === "rolled_back" ? " disabled" : "") + ">Rollback</button>";
+    li.querySelector("button").addEventListener("click", async () => {
+      const data = await postJson("/api/experiments/rollback", { id: experiment.id });
+      if (data.experiment) {
+        upsertExperiment(data.experiment);
+        renderExperiments();
+      }
+    });
+    experimentList.appendChild(li);
+  });
+}
+
 function renderIncidents() {
   incidentSteps.innerHTML = "";
   const sorted = incidents.slice().sort((left, right) => (right.last_seen_at ?? right.created_at) - (left.last_seen_at ?? left.created_at));
@@ -439,6 +508,7 @@ function render() {
   renderChart();
   renderMetricsStrip();
   renderIncidents();
+  renderExperiments();
   renderReport();
 }
 
@@ -468,6 +538,20 @@ function closeDrawer() {
   drawer.setAttribute("aria-hidden", "true");
 }
 
+function openExperiments() {
+  renderExperimentSettings();
+  renderExperiments();
+  experimentBackdrop.hidden = false;
+  experimentDrawer.classList.add("open");
+  experimentDrawer.setAttribute("aria-hidden", "false");
+}
+
+function closeExperiments() {
+  experimentBackdrop.hidden = true;
+  experimentDrawer.classList.remove("open");
+  experimentDrawer.setAttribute("aria-hidden", "true");
+}
+
 startLoad.addEventListener("click", async () => {
   startLoad.disabled = true;
   try {
@@ -487,6 +571,30 @@ stopLoad.addEventListener("click", async () => {
     await postJson("/api/load/stop", {});
   } catch (error) {
     statusSubtitle.textContent = error.message;
+  }
+});
+
+openExperimentLab.addEventListener("click", openExperiments);
+closeExperimentLab.addEventListener("click", closeExperiments);
+experimentBackdrop.addEventListener("click", closeExperiments);
+experimentSetting.addEventListener("change", () => {
+  experimentValue.value = experimentSettings[experimentSetting.value]?.risky ?? "";
+});
+applyExperiment.addEventListener("click", async () => {
+  applyExperiment.disabled = true;
+  try {
+    const data = await postJson("/api/experiments/apply", {
+      setting: experimentSetting.value,
+      value: experimentValue.value
+    });
+    if (data.experiment) {
+      upsertExperiment(data.experiment);
+      renderExperiments();
+    }
+  } catch (error) {
+    statusSubtitle.textContent = error.message;
+  } finally {
+    applyExperiment.disabled = false;
   }
 });
 

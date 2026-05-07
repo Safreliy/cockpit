@@ -22,6 +22,17 @@ WEB_ROOT = ROOT / "web_cockpit"
 COMPOSE_FILE = ROOT / "infra" / "docker-compose.yml"
 
 
+EXPERIMENT_SETTINGS: dict[str, dict[str, str]] = {
+    "work_mem": {"default": "4MB", "risky": "64kB", "description": "Per-operation memory; low values can force temp files."},
+    "maintenance_work_mem": {"default": "64MB", "risky": "1MB", "description": "Maintenance memory; low values can slow VACUUM/CREATE INDEX."},
+    "random_page_cost": {"default": "4", "risky": "10", "description": "Planner IO cost; high values can change query plans."},
+    "max_parallel_workers_per_gather": {"default": "2", "risky": "0", "description": "Disables parallel query for foreground workload."},
+    "autovacuum_vacuum_cost_delay": {"default": "2ms", "risky": "0", "description": "Lower delay makes autovacuum more aggressive."},
+    "autovacuum_vacuum_cost_limit": {"default": "-1", "risky": "10000", "description": "Higher limit can make autovacuum consume more IO."},
+    "log_min_duration_statement": {"default": "-1", "risky": "0", "description": "Logs every statement; useful but noisy."},
+}
+
+
 DETECTORS: list[dict[str, Any]] = [
     {
         "id": "rules.postgres.high_concurrency.v1",
@@ -259,6 +270,7 @@ class TelemetryStore:
         self.incidents: deque[dict[str, Any]] = deque(maxlen=max_detections)
         self.operational_events: deque[dict[str, Any]] = deque(maxlen=300)
         self.settings: dict[str, dict[str, str]] = {}
+        self.experiments: deque[dict[str, Any]] = deque(maxlen=100)
         self.last_config_reload_time: float | None = None
         self.active_by_type: dict[str, str] = {}
         self.clients: list[queue.Queue[dict[str, Any]]] = []
@@ -348,6 +360,115 @@ class TelemetryStore:
                     events.append({"type": "operational_event", "event": event})
             for event in events:
                 self._publish_locked(event)
+
+    def run_psql(self, sql: str) -> tuple[bool, str]:
+        psql = shutil.which("psql")
+        if not psql:
+            return False, "psql is not available in backend runtime"
+        env = os.environ.copy()
+        if os.environ.get("PGPASSWORD"):
+            env["PGPASSWORD"] = os.environ["PGPASSWORD"]
+        args = [
+            psql,
+            "-h",
+            os.environ.get("PGHOST", "127.0.0.1"),
+            "-p",
+            os.environ.get("PGPORT", "55432"),
+            "-U",
+            os.environ.get("PGUSER", "cockpit"),
+            "-d",
+            os.environ.get("PGDATABASE", "cockpit"),
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-q",
+            "-c",
+            sql,
+        ]
+        process = subprocess.run(args, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+        return process.returncode == 0, process.stdout.strip()
+
+    def run_psql_many(self, statements: list[str]) -> tuple[bool, str]:
+        output: list[str] = []
+        for statement in statements:
+            ok, message = self.run_psql(statement)
+            if message:
+                output.append(message)
+            if not ok:
+                return False, "\n".join(output)
+        return True, "\n".join(output)
+
+    def apply_setting_experiment(self, name: str, value: str) -> tuple[bool, str, dict[str, Any] | None]:
+        if name not in EXPERIMENT_SETTINGS:
+            return False, "setting is not allowed for cockpit experiments", None
+        if not self.is_safe_setting_value(value):
+            return False, "setting value contains unsupported characters", None
+        with self.lock:
+            previous = dict(self.settings.get(name, {"setting": EXPERIMENT_SETTINGS[name]["default"], "unit": ""}))
+        ok, output = self.run_psql_many([f"ALTER SYSTEM SET {name} = '{value}'", "SELECT pg_reload_conf()"])
+        if not ok:
+            return False, output or "failed to apply setting", None
+        experiment = {
+            "id": f"exp-{name}-{int(time.time())}",
+            "t": int(time.time()),
+            "type": "postgres_setting_experiment",
+            "status": "applied",
+            "setting": name,
+            "value": value,
+            "previous": previous,
+            "summary": f"Applied experiment: {name} = {value}.",
+        }
+        event = {
+            "id": f"op-experiment-{name}-{experiment['t']}",
+            "t": experiment["t"],
+            "type": "postgres_setting_experiment",
+            "severity": "warning",
+            "summary": experiment["summary"],
+            "setting": name,
+            "previous": previous,
+            "current": {"setting": value},
+        }
+        with self.lock:
+            self.experiments.append(experiment)
+            self.operational_events.append(event)
+            self._publish_locked({"type": "operational_event", "event": event})
+            self._publish_locked({"type": "experiment", "experiment": experiment})
+        return True, "applied", experiment
+
+    def rollback_setting_experiment(self, experiment_id: str) -> tuple[bool, str, dict[str, Any] | None]:
+        with self.lock:
+            experiment = next((item for item in self.experiments if item["id"] == experiment_id), None)
+        if not experiment:
+            return False, "experiment not found", None
+        if experiment.get("status") == "rolled_back":
+            return False, "experiment is already rolled back", experiment
+        name = str(experiment["setting"])
+        previous_value = str(experiment.get("previous", {}).get("setting", EXPERIMENT_SETTINGS[name]["default"]))
+        if not self.is_safe_setting_value(previous_value):
+            return False, "previous setting value is unsupported", None
+        ok, output = self.run_psql_many([f"ALTER SYSTEM SET {name} = '{previous_value}'", "SELECT pg_reload_conf()"])
+        if not ok:
+            return False, output or "failed to roll back setting", None
+        with self.lock:
+            experiment["status"] = "rolled_back"
+            experiment["rolled_back_at"] = int(time.time())
+            event = {
+                "id": f"op-experiment-rollback-{name}-{experiment['rolled_back_at']}",
+                "t": experiment["rolled_back_at"],
+                "type": "postgres_setting_rollback",
+                "severity": "info",
+                "summary": f"Rolled back experiment: {name} = {previous_value}.",
+                "setting": name,
+                "current": {"setting": previous_value},
+            }
+            self.operational_events.append(event)
+            self._publish_locked({"type": "operational_event", "event": event})
+            self._publish_locked({"type": "experiment", "experiment": experiment})
+            return True, "rolled back", experiment
+
+    def is_safe_setting_value(self, value: str) -> bool:
+        if not value or len(value) > 32:
+            return False
+        return all(char.isalnum() or char in "._-" for char in value)
 
     def upsert_incident_locked(self, detection: dict[str, Any]) -> dict[str, Any]:
         incident_id = self.active_by_type.get(detection["type"])
@@ -454,6 +575,8 @@ class TelemetryStore:
                 "incidents": list(self.incidents),
                 "operational_events": list(self.operational_events),
                 "settings": self.settings,
+                "experiments": list(self.experiments),
+                "experiment_settings": EXPERIMENT_SETTINGS,
                 "detectors": DETECTORS,
                 "load": self.load_status_locked(),
                 "retention": {
@@ -648,6 +771,19 @@ class Handler(SimpleHTTPRequestHandler):
                 str(payload.get("note", "")),
             )
             self.write_json({"ok": ok, "message": message, "incident": incident}, status=200 if ok else 400)
+            return
+        if parsed.path == "/api/experiments/apply":
+            payload = self.read_json()
+            ok, message, experiment = self.store.apply_setting_experiment(
+                str(payload.get("setting", "")),
+                str(payload.get("value", "")),
+            )
+            self.write_json({"ok": ok, "message": message, "experiment": experiment}, status=200 if ok else 400)
+            return
+        if parsed.path == "/api/experiments/rollback":
+            payload = self.read_json()
+            ok, message, experiment = self.store.rollback_setting_experiment(str(payload.get("id", "")))
+            self.write_json({"ok": ok, "message": message, "experiment": experiment}, status=200 if ok else 400)
             return
         self.send_error(404)
 

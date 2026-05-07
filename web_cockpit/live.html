@@ -25,6 +25,7 @@
         </label>
         <button id="startLoad" type="button">Start load</button>
         <button id="stopLoad" type="button">Stop</button>
+        <button id="openExperimentLab" type="button">DBA lab</button>
       </div>
     </header>
 
@@ -99,6 +100,35 @@
       <button class="status-action" data-status="false_positive" type="button">False positive</button>
     </div>
     <section class="tab-panel active" id="tab-diagnosis"></section>
+  </aside>
+
+  <div class="drawer-backdrop" id="experimentBackdrop" hidden></div>
+  <aside class="drawer experiment-drawer" id="experimentDrawer" aria-hidden="true">
+    <div class="drawer-header">
+      <div>
+        <span class="eyebrow">Sandbox only</span>
+        <h2>DBA experiment lab</h2>
+      </div>
+      <button id="closeExperimentLab" type="button">Close</button>
+    </div>
+    <div class="warning-block">
+      This changes PostgreSQL settings with ALTER SYSTEM and reloads config. Use only in the local cockpit sandbox.
+    </div>
+    <section class="experiment-form">
+      <label>
+        Setting
+        <select id="experimentSetting"></select>
+      </label>
+      <label>
+        Value
+        <input id="experimentValue" type="text" value="">
+      </label>
+      <button id="applyExperiment" class="report-button" type="button">Apply change</button>
+    </section>
+    <section>
+      <h2>Experiments</h2>
+      <ol class="experiment-list" id="experimentList"></ol>
+    </section>
   </aside>
 
   <script src="live_app.js"></script>

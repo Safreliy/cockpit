@@ -643,6 +643,82 @@ svg {
   margin-bottom: 14px;
 }
 
+.experiment-drawer {
+  width: min(560px, 100vw);
+}
+
+.warning-block {
+  border: 1px solid rgba(154, 97, 0, 0.35);
+  border-radius: 8px;
+  background: #fff8ec;
+  color: var(--warn);
+  padding: 12px;
+  margin-bottom: 14px;
+  line-height: 1.4;
+}
+
+.experiment-form {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.experiment-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.experiment-form input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px 10px;
+  color: var(--ink);
+  font: inherit;
+}
+
+.experiment-list {
+  display: grid;
+  gap: 10px;
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.experiment-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-muted);
+  padding: 11px;
+}
+
+.experiment-item strong,
+.experiment-item span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.experiment-item span {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.experiment-item.status-applied {
+  border-color: rgba(154, 97, 0, 0.45);
+  background: #fff8ec;
+}
+
+.experiment-item.status-rolled_back {
+  opacity: 0.72;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
