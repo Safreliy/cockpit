@@ -74,3 +74,43 @@ def test_detector_pipeline_can_be_filtered_by_detector_id():
     filtered_signals = evaluate_detectors(point, [], {"rules.postgres.high_concurrency.v1"})
     assert {signal["type"] for signal in all_signals} >= {"high_concurrency", "wait_contention", "read_io_pressure", "vacuum_pressure"}
     assert [signal["type"] for signal in filtered_signals] == ["high_concurrency"]
+
+
+def test_statistical_detector_emits_throughput_rise_from_idle_baseline():
+    history = [{"t": float(index), "xact_rate": 0.0} for index in range(12)]
+    point = {
+        "t": 20.0,
+        "xact_rate": 120.0,
+        "active_connections": 12.0,
+        "waiting_connections": 0.0,
+        "vacuum_max_elapsed_seconds": 0.0,
+    }
+    signals = evaluate_detectors(point, history, {"stats.postgres.throughput_change.v1"})
+    assert [signal["type"] for signal in signals] == ["throughput_rise"]
+
+
+def test_ml_detector_detects_workload_rise_and_drop_transitions():
+    detector = MLBasedSuspicionDetector()
+    idle_history = [{"t": float(index), "xact_rate": 0.0, "active_connections": 1.0} for index in range(20)]
+    rise_point = {
+        "t": 30.0,
+        "xact_rate": 120.0,
+        "active_connections": 20.0,
+        "waiting_connections": 0.0,
+        "blk_read_time_ms_rate": 0.0,
+        "vacuum_max_elapsed_seconds": 0.0,
+    }
+    rise_signals = detector.detect(rise_point, idle_history)
+    assert [signal["type"] for signal in rise_signals] == ["ml_suspicious_activity"]
+
+    busy_history = [{"t": float(index), "xact_rate": 200.0, "active_connections": 20.0} for index in range(20)]
+    drop_point = {
+        "t": 30.0,
+        "xact_rate": 0.0,
+        "active_connections": 1.0,
+        "waiting_connections": 0.0,
+        "blk_read_time_ms_rate": 0.0,
+        "vacuum_max_elapsed_seconds": 0.0,
+    }
+    drop_signals = detector.detect(drop_point, busy_history)
+    assert [signal["type"] for signal in drop_signals] == ["ml_suspicious_activity"]
