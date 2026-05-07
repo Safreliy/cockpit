@@ -12,6 +12,7 @@ The project started as a causal load simulator and now includes a local live sta
 - Aggregates detector signals into incident periods by fingerprint.
 - Shows incident lifecycle: candidate, active, recovering, resolved, acknowledged, false positive.
 - Displays an investigation process that can later be driven by ML/AI inference.
+- Runs an optional OpenAI-compatible causal agent for incident verdicts when `LLM_API_KEY` is configured.
 - Provides a sandbox-only DBA experiment lab for controlled PostgreSQL setting changes and rollback.
 - Keeps telemetry bounded: backend uses rolling memory buffers, Prometheus has TSDB retention.
 
@@ -55,11 +56,25 @@ web_cockpit/index.html
 python -m pytest
 ```
 
+## Optional LLM Agent
+
+Configure an OpenAI-compatible endpoint through environment variables before starting Docker Compose:
+
+```powershell
+$env:LLM_BASE_URL="http://host.docker.internal:8000/v1"
+$env:LLM_MODEL="Qwen3.5-122B-A10B-AWQ-8bit"
+$env:LLM_API_KEY="<your-key>"
+docker compose -f infra/docker-compose.yml up -d --build
+```
+
+The agent uses a replaceable interface: LLM client, monitoring tools, memory store, and causal verdict sink are separate components.
+
 ## Main Paths
 
 - `tools/cockpit_backend.py` - live backend, SSE, incidents, load control.
 - `tools/cockpit/detectors.py` - detector interface and signal pipeline.
 - `tools/cockpit/experiments.py` - DBA experiment allowlist.
+- `tools/cockpit/agent.py` - optional LLM causal investigation agent interfaces.
 - `tools/live_pg_monitor.py` - Prometheus query helpers.
 - `web_cockpit/live.html` - live incident cockpit UI.
 - `web_cockpit/index.html` - static simulator replay UI.

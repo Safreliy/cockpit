@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from cockpit.agent import CausalAgent, IncidentVerdictTool, JsonMemoryStore, OpenAICompatibleClient, OperationalContextTool, SnapshotTool
 from cockpit.detectors import build_investigation, detector_catalog, evaluate_detectors
 from cockpit.experiments import EXPERIMENT_SETTINGS
 from live_pg_monitor import QUERIES, query_prometheus, query_settings
@@ -60,6 +61,7 @@ class TelemetryStore:
         self.load_output: deque[str] = deque(maxlen=40)
         self.load_script_path: str | None = None
         self.enabled_detector_ids: set[str] | None = None
+        self.agent_runs: dict[str, dict[str, Any]] = {}
 
     def add_point(self, point: dict[str, float]) -> None:
         events: list[dict[str, Any]] = [{"type": "telemetry", "point": point}]
@@ -420,6 +422,84 @@ class TelemetryStore:
             self._publish_locked({"type": "incident", "incident": incident})
             return True, "updated", incident
 
+    def start_agent_inference(self, incident_id: str) -> tuple[bool, str, dict[str, Any] | None]:
+        with self.lock:
+            incident = next((item for item in self.incidents if item["id"] == incident_id), None)
+            if incident is None:
+                return False, "incident not found", None
+            run = self.agent_runs.get(incident_id)
+            if run and run.get("status") == "running":
+                return False, "agent inference is already running", incident
+            now = int(time.time())
+            run = {
+                "id": f"agent-run-{incident_id}-{now}",
+                "incident_id": incident_id,
+                "status": "running",
+                "started_at": now,
+                "engine": os.environ.get("LLM_MODEL") or "Qwen3.5-122B-A10B-AWQ-8bit",
+            }
+            self.agent_runs[incident_id] = run
+            investigation = incident.setdefault("investigation", {})
+            investigation["state"] = "agent_inference"
+            investigation["phase"] = "agent_collecting_context"
+            investigation["progress"] = max(int(investigation.get("progress", 0)), 35)
+            investigation["agent_run"] = run
+            self._publish_locked({"type": "incident", "incident": incident})
+        threading.Thread(target=self.run_agent_inference, args=(incident_id,), daemon=True).start()
+        return True, "started", incident
+
+    def run_agent_inference(self, incident_id: str) -> None:
+        try:
+            incident = self.get_incident(incident_id)
+            if not incident:
+                return
+            agent = CausalAgent(
+                llm=OpenAICompatibleClient(),
+                tools=[
+                    SnapshotTool(self.snapshot),
+                    OperationalContextTool(self.snapshot),
+                    IncidentVerdictTool(self),
+                ],
+                memory=JsonMemoryStore(ROOT / "output" / "agent_memory.json"),
+            )
+            agent.investigate(incident)
+        except Exception as error:
+            with self.lock:
+                run = self.agent_runs.get(incident_id, {})
+                run.update({"status": "failed", "finished_at": int(time.time()), "error": str(error)})
+                incident = next((item for item in self.incidents if item["id"] == incident_id), None)
+                if incident:
+                    investigation = incident.setdefault("investigation", {})
+                    investigation["state"] = "agent_failed"
+                    investigation["phase"] = "agent_error"
+                    investigation["agent_run"] = run
+                    self._publish_locked({"type": "incident", "incident": incident})
+
+    def submit_verdict(self, incident_id: str, verdict: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            incident = next((item for item in self.incidents if item["id"] == incident_id), None)
+            if incident is None:
+                return {"ok": False, "message": "incident not found"}
+            now = int(time.time())
+            run = self.agent_runs.get(incident_id, {})
+            run.update({"status": "complete", "finished_at": now, "engine": verdict.get("engine", run.get("engine"))})
+            incident["agent_verdict"] = verdict
+            if verdict.get("causal_chain"):
+                incident["causal_chain"] = verdict["causal_chain"]
+            if verdict.get("supporting_evidence"):
+                incident["agent_evidence"] = verdict["supporting_evidence"]
+            if verdict.get("confidence") is not None:
+                incident["agent_confidence"] = verdict["confidence"]
+            investigation = incident.setdefault("investigation", {})
+            investigation["state"] = "agent_complete"
+            investigation["phase"] = "causal_verdict_ready"
+            investigation["progress"] = 100
+            investigation["summary"] = f"Agent verdict: {verdict.get('root_cause', 'unknown cause')}"
+            investigation["agent_run"] = run
+            investigation["updated_at"] = now
+            self._publish_locked({"type": "incident", "incident": incident})
+            return {"ok": True, "incident": incident}
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
@@ -429,6 +509,12 @@ class TelemetryStore:
                 "detections": list(self.detections),
                 "signals": list(self.signals),
                 "incidents": list(self.incidents),
+                "agent": {
+                    "enabled": bool(os.environ.get("LLM_API_KEY")),
+                    "model": os.environ.get("LLM_MODEL") or "Qwen3.5-122B-A10B-AWQ-8bit",
+                    "base_url": os.environ.get("LLM_BASE_URL") or "http://127.0.0.1:8000/v1",
+                    "runs": list(self.agent_runs.values())[-50:],
+                },
                 "operational_events": list(self.operational_events),
                 "settings": self.settings,
                 "experiments": list(self.experiments),
@@ -709,6 +795,11 @@ class Handler(SimpleHTTPRequestHandler):
                 str(payload.get("note", "")),
             )
             self.write_json({"ok": ok, "message": message, "incident": incident}, status=200 if ok else 400)
+            return
+        if parsed.path == "/api/incidents/infer":
+            payload = self.read_json()
+            ok, message, incident = self.store.start_agent_inference(str(payload.get("id", "")))
+            self.write_json({"ok": ok, "message": message, "incident": incident}, status=202 if ok else 400)
             return
         if parsed.path == "/api/detectors":
             payload = self.read_json()

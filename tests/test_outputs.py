@@ -56,4 +56,5 @@ def test_run_generates_all_mvp_artifacts():
     assert "Target TPS" in live_html
     assert "planner range scan" in live_html
     assert "sort pressure" in live_html
+    assert "Run AI inference" in live_html
     assert Path("tools/cockpit_backend.py").exists()

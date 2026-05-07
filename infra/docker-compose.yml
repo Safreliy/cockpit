@@ -68,6 +68,9 @@ services:
       PGDATABASE: cockpit
       PGUSER: cockpit
       PGPASSWORD: cockpit
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
+      LLM_MODEL: ${LLM_MODEL:-Qwen3.5-122B-A10B-AWQ-8bit}
+      LLM_API_KEY: ${LLM_API_KEY:-}
     ports:
       - "8088:8088"
     depends_on:

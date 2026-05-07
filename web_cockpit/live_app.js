@@ -78,6 +78,7 @@ const applyExperiment = document.getElementById("applyExperiment");
 const experimentList = document.getElementById("experimentList");
 const statusActions = document.querySelectorAll(".status-action");
 const refreshIncident = document.getElementById("refreshIncident");
+const runAgentInference = document.getElementById("runAgentInference");
 
 function formatValue(value) {
   if (value == null) return "--";
@@ -545,6 +546,7 @@ function incidentReportVersion(incident) {
     incident.updated_at,
     incident.investigation?.phase,
     incident.investigation?.progress,
+    incident.agent_verdict?.generated_at,
     showAllOps ? "all-ops" : "latest-ops"
   ].join("|");
 }
@@ -588,12 +590,22 @@ function renderReport(options = {}) {
   const timeline = (incident.timeline ?? []).slice(-12).reverse().map((item) => (
     '<li><strong>' + item.type + '</strong><span>' + formatClock(item.t) + ' - ' + item.metric + ' = ' + formatValue(item.value) + ' · score ' + formatValue(item.score) + '</span></li>'
   )).join("");
+  const verdict = incident.agent_verdict ?? null;
+  const verdictChain = (verdict?.causal_chain ?? []).map((item) => (
+    '<div class="chain-step done"><span>' + item.stage + '</span><strong>' + item.label + '</strong><small>' + item.detail + '</small></div>'
+  )).join("");
+  const verdictEvidence = (verdict?.supporting_evidence ?? []).map((item) => "<li>" + item + "</li>").join("");
+  const counterEvidence = (verdict?.counter_evidence ?? []).map((item) => "<li>" + item + "</li>").join("");
+  const agentBlock = verdict
+    ? '<div class="report-block"><strong>AI causal verdict</strong><p>Root cause: ' + (verdict.root_cause ?? "unknown") + ' · confidence ' + formatValue((verdict.confidence ?? 0) * 100) + '% · engine ' + (verdict.engine ?? "agent") + '</p><div class="chain">' + verdictChain + '</div><strong>Supporting evidence</strong><ul class="next-actions">' + verdictEvidence + '</ul><strong>Counter evidence</strong><ul class="next-actions">' + (counterEvidence || "<li>None captured.</li>") + '</ul></div>'
+    : '<div class="report-block"><strong>AI causal verdict</strong><p>No agent verdict yet. Run AI inference to collect context and submit a causal-chain verdict.</p></div>';
   document.getElementById("tab-diagnosis").innerHTML =
     '<div class="report-block"><strong>Status</strong><p><span class="status-pill">' + incident.status + "</span> confidence " + formatValue((incident.confidence ?? 0) * 100) + "%</p></div>" +
     '<div class="report-block"><strong>Incident period</strong><p>' + formatClock(incident.started_at ?? incident.created_at) + " - " + formatClock(incident.resolved_at ?? incident.last_seen_at) + " · signals " + (incident.signal_count ?? 1) + " · fingerprint " + (incident.fingerprint ?? incident.type) + '</p></div>' +
     '<div class="report-block"><strong>Investigation process</strong><div class="investigation-header"><div><span class="status-pill">' + (investigation.state ?? "queued") + '</span><strong>' + (investigation.phase ?? "queued") + '</strong><p>' + (investigation.summary ?? "Waiting for incident evidence.") + '</p></div><div class="progress-ring" style="--progress:' + Math.max(0, Math.min(100, investigation.progress ?? 0)) + '%"><span>' + formatValue(investigation.progress ?? 0) + '%</span></div></div><ol class="investigation-list">' + investigationSteps + '</ol></div>' +
     '<div class="report-block"><strong>Inference engine</strong><p>' + (investigation.engine?.mode ?? "hybrid inference") + " · " + (investigation.engine?.current ?? "active detector pipeline") + '</p></div>' +
     '<div class="report-block"><strong>Detector</strong><p>' + detector.name + " · engine: " + detector.engine + '</p></div>' +
+    agentBlock +
     '<div class="report-block"><strong>Detected metric</strong><p>' + incident.metric + " = " + formatValue(incident.value) + " threshold " + formatValue(incident.threshold) + '</p></div>' +
     '<div class="report-block"><strong>Time window</strong><p>' + formatClock(incident.created_at) + " - " + formatClock(incident.last_seen_at) + " · samples " + incident.sample_count + '</p></div>' +
     '<div class="report-block"><strong>Interpretation</strong><p>' + incident.summary + '</p></div>' +
@@ -912,6 +924,25 @@ refreshIncident.addEventListener("click", async () => {
     renderStatus();
     renderIncidents();
     renderReport({ force: true });
+  }
+});
+
+runAgentInference.addEventListener("click", async () => {
+  const incident = selectedIncident();
+  if (!incident) return;
+  runAgentInference.disabled = true;
+  try {
+    const data = await postJson("/api/incidents/infer", { id: incident.id });
+    if (data.incident) {
+      upsertIncident(data.incident);
+      renderStatus();
+      renderIncidents();
+      renderReport({ force: true });
+    }
+  } catch (error) {
+    statusSubtitle.textContent = error.message;
+  } finally {
+    runAgentInference.disabled = false;
   }
 });
 
