@@ -48,9 +48,20 @@ const metricsStrip = document.getElementById("metricsStrip");
 const incidentSteps = document.getElementById("incidentSteps");
 const startLoad = document.getElementById("startLoad");
 const stopLoad = document.getElementById("stopLoad");
+const stopLoadFromDrawer = document.getElementById("stopLoadFromDrawer");
 const loadClients = document.getElementById("loadClients");
 const loadSeconds = document.getElementById("loadSeconds");
+const loadJobs = document.getElementById("loadJobs");
+const loadRate = document.getElementById("loadRate");
 const loadMode = document.getElementById("loadMode");
+const benchmarkEngine = document.getElementById("benchmarkEngine");
+const benchmarkProfile = document.getElementById("benchmarkProfile");
+const openBenchmarkLab = document.getElementById("openBenchmarkLab");
+const benchmarkDrawer = document.getElementById("benchmarkDrawer");
+const benchmarkBackdrop = document.getElementById("benchmarkBackdrop");
+const closeBenchmarkLab = document.getElementById("closeBenchmarkLab");
+const benchmarkState = document.getElementById("benchmarkState");
+const loadOutput = document.getElementById("loadOutput");
 const detectorPicker = document.getElementById("detectorPicker");
 const openExperimentLab = document.getElementById("openExperimentLab");
 const openReport = document.getElementById("openReport");
@@ -218,12 +229,20 @@ function ingestEvent(event) {
 function renderLoad(load) {
   if (!load) return;
   loadState.textContent = load.running ? "running" : "idle";
+  const config = load.config ?? {};
+  benchmarkState.textContent = load.running
+    ? `${config.engine ?? "workload"} · ${config.clients ?? "--"} clients · ${config.rate ? config.rate + " TPS" : "unlimited"}`
+    : "idle";
+  const output = load.output ?? [];
+  loadOutput.textContent = output.length ? output.join("\n") : "No workload output yet.";
   if (!load.running && load.returncode != null && load.returncode !== 0) {
     loadState.textContent = "failed";
+    benchmarkState.textContent = "failed";
     statusSubtitle.textContent = (load.output ?? []).at(-1) ?? "Load finished with an error.";
   }
   startLoad.disabled = load.running;
   stopLoad.disabled = !load.running;
+  stopLoadFromDrawer.disabled = !load.running;
 }
 
 function selectedDetectorFromCatalog() {
@@ -713,27 +732,86 @@ function closeExperiments() {
   experimentDrawer.setAttribute("aria-hidden", "true");
 }
 
-startLoad.addEventListener("click", async () => {
+function openBenchmark() {
+  benchmarkBackdrop.hidden = false;
+  benchmarkDrawer.classList.add("open");
+  benchmarkDrawer.setAttribute("aria-hidden", "false");
+}
+
+function closeBenchmark() {
+  benchmarkBackdrop.hidden = true;
+  benchmarkDrawer.classList.remove("open");
+  benchmarkDrawer.setAttribute("aria-hidden", "true");
+}
+
+function applyBenchmarkProfile() {
+  const profile = benchmarkProfile.value;
+  if (profile === "steady") {
+    loadMode.value = "mixed";
+    loadClients.value = 24;
+    loadJobs.value = 4;
+    loadSeconds.value = 900;
+    loadRate.value = 300;
+  } else if (profile === "burst") {
+    loadMode.value = "mixed";
+    loadClients.value = 96;
+    loadJobs.value = 8;
+    loadSeconds.value = 180;
+    loadRate.value = 0;
+  } else if (profile === "readonly") {
+    loadMode.value = "readonly";
+    loadClients.value = 48;
+    loadJobs.value = 6;
+    loadSeconds.value = 600;
+    loadRate.value = 500;
+  }
+}
+
+function benchmarkPayload() {
+  return {
+    engine: benchmarkEngine.value,
+    profile: benchmarkProfile.value,
+    clients: Number(loadClients.value),
+    jobs: Number(loadJobs.value),
+    seconds: Number(loadSeconds.value),
+    rate: Number(loadRate.value),
+    mode: loadMode.value
+  };
+}
+
+async function startBenchmark() {
   startLoad.disabled = true;
   try {
-    await postJson("/api/load/start", {
-      clients: Number(loadClients.value),
-      jobs: 4,
-      seconds: Number(loadSeconds.value),
-      mode: loadMode.value
-    });
+    const data = await postJson("/api/load/start", benchmarkPayload());
+    renderLoad(data.load);
+  } catch (error) {
+    statusSubtitle.textContent = error.message;
+    startLoad.disabled = false;
+  }
+}
+
+async function stopBenchmark() {
+  try {
+    const data = await postJson("/api/load/stop", {});
+    renderLoad(data.load);
   } catch (error) {
     statusSubtitle.textContent = error.message;
   }
+}
+
+startLoad.addEventListener("click", async () => {
+  await startBenchmark();
 });
 
 stopLoad.addEventListener("click", async () => {
-  try {
-    await postJson("/api/load/stop", {});
-  } catch (error) {
-    statusSubtitle.textContent = error.message;
-  }
+  await stopBenchmark();
 });
+
+stopLoadFromDrawer.addEventListener("click", stopBenchmark);
+openBenchmarkLab.addEventListener("click", openBenchmark);
+closeBenchmarkLab.addEventListener("click", closeBenchmark);
+benchmarkBackdrop.addEventListener("click", closeBenchmark);
+benchmarkProfile.addEventListener("change", applyBenchmarkProfile);
 
 detectorPicker.addEventListener("change", async () => {
   selectedDetectorId = detectorPicker.value;

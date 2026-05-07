@@ -13,17 +13,8 @@
         <span class="eyebrow">Live Cockpit</span>
         <h1>Incident cockpit</h1>
       </div>
-      <div class="stream-control" aria-label="load controls">
-        <label>Clients <input id="loadClients" class="small-input" type="number" min="1" max="128" value="32"></label>
-        <label>Seconds <input id="loadSeconds" class="small-input" type="number" min="5" max="900" value="60"></label>
-        <label>
-          Mode
-          <select id="loadMode">
-            <option value="mixed">mixed</option>
-            <option value="readonly">readonly</option>
-          </select>
-        </label>
-        <button id="startLoad" type="button">Start load</button>
+      <div class="stream-control" aria-label="cockpit controls">
+        <button id="openBenchmarkLab" type="button">Benchmark lab</button>
         <button id="stopLoad" type="button">Stop</button>
         <button id="openExperimentLab" type="button">DBA lab</button>
         <label>
@@ -134,6 +125,69 @@
     <section>
       <h2>Experiments</h2>
       <ol class="experiment-list" id="experimentList"></ol>
+    </section>
+  </aside>
+
+  <div class="drawer-backdrop" id="benchmarkBackdrop" hidden></div>
+  <aside class="drawer experiment-drawer" id="benchmarkDrawer" aria-hidden="true">
+    <div class="drawer-header">
+      <div>
+        <span class="eyebrow">Workload control</span>
+        <h2>Benchmark lab</h2>
+      </div>
+      <button id="closeBenchmarkLab" type="button">Close</button>
+    </div>
+    <section class="benchmark-grid">
+      <label>
+        Engine
+        <select id="benchmarkEngine">
+          <option value="pgbench">pgbench</option>
+        </select>
+      </label>
+      <label>
+        Profile
+        <select id="benchmarkProfile">
+          <option value="steady">Steady TPS</option>
+          <option value="burst">Burst pressure</option>
+          <option value="readonly">Read-only scan</option>
+          <option value="custom" selected>Custom</option>
+        </select>
+      </label>
+      <label>
+        Mode
+        <select id="loadMode">
+          <option value="mixed">mixed</option>
+          <option value="readonly">readonly</option>
+        </select>
+      </label>
+      <label>
+        Duration, sec
+        <input id="loadSeconds" type="number" min="1" max="86400" value="300">
+      </label>
+      <label>
+        Clients
+        <input id="loadClients" type="number" min="1" max="512" value="32">
+      </label>
+      <label>
+        Jobs
+        <input id="loadJobs" type="number" min="1" max="128" value="4">
+      </label>
+      <label>
+        Target TPS
+        <input id="loadRate" type="number" min="0" max="100000" value="0">
+        <span>0 means unlimited pgbench rate.</span>
+      </label>
+    </section>
+    <section class="benchmark-actions">
+      <button id="startLoad" class="report-button" type="button">Start benchmark</button>
+      <button id="stopLoadFromDrawer" type="button">Stop</button>
+    </section>
+    <section class="load-output">
+      <div class="report-block-head">
+        <strong>Current run</strong>
+        <span id="benchmarkState">idle</span>
+      </div>
+      <pre id="loadOutput">No workload output yet.</pre>
     </section>
   </aside>
 

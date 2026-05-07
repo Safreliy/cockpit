@@ -41,6 +41,7 @@ class TelemetryStore:
         self.lock = threading.Lock()
         self.load_process: subprocess.Popen[str] | None = None
         self.load_started_at: int | None = None
+        self.load_config: dict[str, Any] | None = None
         self.load_output: deque[str] = deque(maxlen=40)
         self.enabled_detector_ids: set[str] | None = None
 
@@ -460,11 +461,11 @@ class TelemetryStore:
                 pass
         self.clients = alive
 
-    def start_load(self, clients: int, jobs: int, seconds: int, mode: str) -> tuple[bool, str]:
+    def start_load(self, config: dict[str, Any]) -> tuple[bool, str]:
         with self.lock:
             if self.load_process and self.load_process.poll() is None:
                 return False, "load is already running"
-        args = self.pgbench_args(clients, jobs, seconds, mode)
+        args, workload = self.workload_args(config)
         env = os.environ.copy()
         if os.environ.get("PGPASSWORD"):
             env["PGPASSWORD"] = os.environ["PGPASSWORD"]
@@ -479,6 +480,7 @@ class TelemetryStore:
         with self.lock:
             self.load_process = process
             self.load_started_at = int(time.time())
+            self.load_config = workload
             self.load_output.clear()
             self._publish_locked({"type": "load", "load": self.load_status_locked()})
         threading.Thread(target=self.capture_load_output, args=(process,), daemon=True).start()
@@ -494,7 +496,32 @@ class TelemetryStore:
         with self.lock:
             self._publish_locked({"type": "load", "load": self.load_status_locked()})
 
-    def pgbench_args(self, clients: int, jobs: int, seconds: int, mode: str) -> list[str]:
+    def workload_args(self, config: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+        engine = str(config.get("engine", "pgbench"))
+        if engine != "pgbench":
+            raise ValueError(f"unsupported workload engine: {engine}")
+        clients = max(1, min(512, int(config.get("clients", 32))))
+        jobs = max(1, min(128, int(config.get("jobs", min(clients, 4)))))
+        seconds = max(1, min(86400, int(config.get("seconds", 60))))
+        mode = str(config.get("mode", "mixed"))
+        rate = max(0, min(100000, int(config.get("rate", 0))))
+        workload = {
+            "engine": engine,
+            "profile": str(config.get("profile", "custom")),
+            "clients": clients,
+            "jobs": jobs,
+            "seconds": seconds,
+            "mode": mode,
+            "rate": rate,
+        }
+        return self.pgbench_args(workload), workload
+
+    def pgbench_args(self, workload: dict[str, Any]) -> list[str]:
+        clients = int(workload["clients"])
+        jobs = int(workload["jobs"])
+        seconds = int(workload["seconds"])
+        mode = str(workload["mode"])
+        rate = int(workload.get("rate", 0))
         pgbench = shutil.which("pgbench")
         if pgbench:
             args = [
@@ -514,6 +541,8 @@ class TelemetryStore:
                 "-P",
                 "5",
             ]
+            if rate > 0:
+                args += ["-R", str(rate)]
             if mode == "readonly":
                 args.append("-S")
             args.append(os.environ.get("PGDATABASE", "cockpit"))
@@ -530,7 +559,10 @@ class TelemetryStore:
         ]
         if mode == "readonly":
             args.append("-S")
-        args += ["-c", str(clients), "-j", str(jobs), "-T", str(seconds), "-P", "5", "-U", "cockpit", "cockpit"]
+        args += ["-c", str(clients), "-j", str(jobs), "-T", str(seconds), "-P", "5"]
+        if rate > 0:
+            args += ["-R", str(rate)]
+        args += ["-U", "cockpit", "cockpit"]
         return args
 
     def stop_load(self) -> tuple[bool, str]:
@@ -553,6 +585,7 @@ class TelemetryStore:
             "running": running,
             "started_at": self.load_started_at if running else None,
             "returncode": None if running or not self.load_process else self.load_process.returncode,
+            "config": self.load_config,
             "output": list(self.load_output)[-10:],
         }
 
@@ -607,12 +640,12 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/load/start":
             payload = self.read_json()
-            clients = int(payload.get("clients", 32))
-            jobs = int(payload.get("jobs", 4))
-            seconds = int(payload.get("seconds", 60))
-            mode = str(payload.get("mode", "mixed"))
-            ok, message = self.store.start_load(clients, jobs, seconds, mode)
-            self.write_json({"ok": ok, "message": message, "load": self.store.snapshot()["load"]}, status=200 if ok else 409)
+            try:
+                ok, message = self.store.start_load(payload)
+                status = 200 if ok else 409
+            except (TypeError, ValueError) as error:
+                ok, message, status = False, str(error), 400
+            self.write_json({"ok": ok, "message": message, "load": self.store.snapshot()["load"]}, status=status)
             return
         if parsed.path == "/api/load/stop":
             ok, message = self.store.stop_load()

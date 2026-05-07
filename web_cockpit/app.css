@@ -667,6 +667,53 @@ svg {
   width: min(560px, 100vw);
 }
 
+.benchmark-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.benchmark-grid label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.benchmark-grid label:last-child {
+  grid-column: 1 / -1;
+}
+
+.benchmark-grid input,
+.benchmark-grid select {
+  width: 100%;
+}
+
+.benchmark-grid span {
+  font-size: 12px;
+}
+
+.benchmark-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.load-output pre {
+  min-height: 120px;
+  max-height: 220px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #111827;
+  color: #e5edf7;
+  font: 12px/1.45 Consolas, "SFMono-Regular", monospace;
+  white-space: pre-wrap;
+}
+
 .warning-block {
   border: 1px solid rgba(154, 97, 0, 0.35);
   border-radius: 8px;

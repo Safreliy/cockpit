@@ -51,5 +51,7 @@ def test_run_generates_all_mvp_artifacts():
     assert "new EventSource(API_BASE + \"/events\")" in live_js
     assert "http://127.0.0.1:8088" in live_js
     assert "/api/load/start" in live_js
-    assert "Start load" in Path("web_cockpit/live.html").read_text(encoding="utf-8")
+    live_html = Path("web_cockpit/live.html").read_text(encoding="utf-8")
+    assert "Benchmark lab" in live_html
+    assert "Target TPS" in live_html
     assert Path("tools/cockpit_backend.py").exists()
