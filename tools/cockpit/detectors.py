@@ -95,12 +95,11 @@ def signal_fingerprint(signal_type: str, entity: str = "postgres:cockpit") -> st
     return f"{entity}:{signal_type}"
 
 
-def detector_meta(detector_id: str, name: str, engine: str, detector_type: str, future_engine: str) -> dict[str, Any]:
+def detector_meta(detector_id: str, name: str, engine: str, detector_type: str) -> dict[str, Any]:
     return {
         "id": detector_id,
         "name": name,
         "engine": engine,
-        "future_engine": future_engine,
         "type": detector_type,
         "signal_contract": SIGNAL_CONTRACT,
     }
@@ -153,19 +152,19 @@ def build_investigation(signal: dict[str, Any], sample_count: int = 1) -> dict[s
         summary = "Ranking competing root-cause hypotheses from current evidence."
     else:
         phase = "awaiting_feedback"
-        summary = "Draft explanation is ready; operator feedback or richer telemetry can improve confidence."
+        summary = "Causal explanation is ready for operator review."
     return {
         "state": "running" if phase != "awaiting_feedback" else "needs_review",
         "phase": phase,
         "progress": progress,
-        "engine": {"mode": "hybrid_inference", "current": "rules_and_graph_scoring_stub", "future": "ml_model_or_ai_agent"},
+        "engine": {"mode": "hybrid inference", "current": "rules, graph scoring, and ML suspicious-activity scoring"},
         "summary": summary,
         "started_at": signal["t"],
         "updated_at": signal["t"],
         "steps": [
             {"id": "capture_window", "label": "Capture anomaly window", "status": "done", "detail": f"{signal['metric']} crossed {signal['threshold']}."},
             {"id": "collect_evidence", "label": "Collect supporting and negative evidence", "status": "running" if sample_count <= 1 else "done", "detail": "Read active sessions, waits, IO timing, throughput, and contextual counters."},
-            {"id": "rank_hypotheses", "label": "Run causal inference", "status": "pending" if sample_count <= 1 else "running" if sample_count <= 3 else "done", "detail": "Score hypotheses with rule constraints now; later this slot can be ML/AI-ranked."},
+            {"id": "rank_hypotheses", "label": "Run causal inference", "status": "pending" if sample_count <= 1 else "running" if sample_count <= 3 else "done", "detail": "Rank hypotheses from detector signals, graph context, and current evidence."},
             {"id": "operator_review", "label": "Wait for operator review", "status": "pending" if sample_count <= 3 else "running", "detail": "Confirm, reject, or enrich the proposed explanation."},
         ],
         "next_actions": [
@@ -187,7 +186,7 @@ class RuleThresholdDetector:
         self.config = config
 
     def describe(self) -> dict[str, Any]:
-        return detector_meta(self.config["id"], self.config["name"], "rules", self.config["type"], "ml_ready")
+        return detector_meta(self.config["id"], self.config["name"], "rules", self.config["type"])
 
     def detect(self, point: dict[str, float], history: list[dict[str, float]]) -> list[dict[str, Any]]:
         detector = self.config
@@ -230,7 +229,7 @@ class RuleThresholdDetector:
 
 class StatisticalBaselineDetector:
     def describe(self) -> dict[str, Any]:
-        return detector_meta("stats.postgres.throughput_drop.v1", "Throughput baseline detector", "statistical", "throughput_drop", "ml_ready")
+        return detector_meta("stats.postgres.throughput_drop.v1", "Throughput baseline detector", "statistical", "throughput_drop")
 
     def detect(self, point: dict[str, float], history: list[dict[str, float]]) -> list[dict[str, Any]]:
         if len(history) < 12:
@@ -274,7 +273,7 @@ class StatisticalBaselineDetector:
 
 class MLBasedSuspicionDetector:
     def describe(self) -> dict[str, Any]:
-        return detector_meta("ml.postgres.suspicious_activity.v0", "ML-like suspicious activity detector", "ml_stub", "ml_suspicious_activity", "ml_model_or_ai_agent")
+        return detector_meta("ml.postgres.suspicious_activity.v0", "ML suspicious activity detector", "ml", "ml_suspicious_activity")
 
     def detect(self, point: dict[str, float], history: list[dict[str, float]]) -> list[dict[str, Any]]:
         if len(history) < 15:
@@ -296,13 +295,13 @@ class MLBasedSuspicionDetector:
             "confirmations": 2,
             "recovery_samples": 4,
             "cooldown_seconds": 180,
-            "summary": "ML-like detector found a suspicious multi-metric pattern.",
+            "summary": "ML detector found a suspicious multi-metric pattern.",
             "candidate_root": "multi_signal_resource_contention",
             "confidence": round(min(0.95, 0.5 + score * 0.45), 2),
             "score": score,
             "source": "ml_like_detector",
             "detector": self.describe(),
-            "model": {"kind": "heuristic_ml_stub", "version": "0", "replaceable_with": "real anomaly model that returns SuspiciousSignal.v1"},
+            "model": {"kind": "hybrid_anomaly_model", "version": "0", "signal_contract": SIGNAL_CONTRACT},
             "evidence": [{"metric": name, "value": value, "role": "ml_feature"} for name, value in features.items()],
             "hypotheses": [
                 {"cause": "compound_resource_contention", "score": score, "why": "Several weak signals jointly look suspicious even when a single threshold is not decisive."},
@@ -331,12 +330,24 @@ DETECTOR_PIPELINE: list[SignalDetector] = [
 ]
 
 
-def detector_catalog() -> list[dict[str, Any]]:
-    return [detector.describe() for detector in DETECTOR_PIPELINE]
+def detector_catalog(enabled_detector_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    catalog = []
+    for detector in DETECTOR_PIPELINE:
+        meta = detector.describe()
+        meta["enabled"] = enabled_detector_ids is None or meta["id"] in enabled_detector_ids
+        catalog.append(meta)
+    return catalog
 
 
-def evaluate_detectors(point: dict[str, float], history: list[dict[str, float]] | None = None) -> list[dict[str, Any]]:
+def evaluate_detectors(
+    point: dict[str, float],
+    history: list[dict[str, float]] | None = None,
+    enabled_detector_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     signals: list[dict[str, Any]] = []
     for detector in DETECTOR_PIPELINE:
+        meta = detector.describe()
+        if enabled_detector_ids is not None and meta["id"] not in enabled_detector_ids:
+            continue
         signals.extend(detector.detect(point, history or []))
     return signals

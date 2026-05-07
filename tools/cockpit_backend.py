@@ -42,12 +42,13 @@ class TelemetryStore:
         self.load_process: subprocess.Popen[str] | None = None
         self.load_started_at: int | None = None
         self.load_output: deque[str] = deque(maxlen=40)
+        self.enabled_detector_ids: set[str] | None = None
 
     def add_point(self, point: dict[str, float]) -> None:
         events: list[dict[str, Any]] = [{"type": "telemetry", "point": point}]
         with self.lock:
             history = list(self.points)
-            signals = evaluate_detectors(point, history)
+            signals = evaluate_detectors(point, history, self.enabled_detector_ids)
             seen_fingerprints = {signal["fingerprint"] for signal in signals}
             self.points.append(point)
             for signal in signals:
@@ -415,7 +416,7 @@ class TelemetryStore:
                 "settings": self.settings,
                 "experiments": list(self.experiments),
                 "experiment_settings": EXPERIMENT_SETTINGS,
-                "detectors": detector_catalog(),
+                "detectors": detector_catalog(self.enabled_detector_ids),
                 "load": self.load_status_locked(),
                 "retention": {
                     "telemetry_points": self.points.maxlen,
@@ -425,6 +426,18 @@ class TelemetryStore:
                     "disk_policy": "backend keeps rolling memory only; Prometheus retention is configured in infra/docker-compose.yml",
                 },
             }
+
+    def set_enabled_detectors(self, detector_ids: list[str]) -> tuple[bool, str, list[dict[str, Any]]]:
+        known_ids = {item["id"] for item in detector_catalog()}
+        requested = {str(item) for item in detector_ids if str(item)}
+        unknown = requested - known_ids
+        if requested and unknown:
+            return False, f"unknown detector ids: {', '.join(sorted(unknown))}", detector_catalog(self.enabled_detector_ids)
+        with self.lock:
+            self.enabled_detector_ids = requested or None
+            catalog = detector_catalog(self.enabled_detector_ids)
+            self._publish_locked({"type": "detectors", "detectors": catalog})
+            return True, "updated", catalog
 
     def subscribe(self) -> queue.Queue[dict[str, Any]]:
         client: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=100)
@@ -574,6 +587,9 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/snapshot":
             self.write_json(self.store.snapshot())
             return
+        if parsed.path == "/api/detectors":
+            self.write_json({"ok": True, "detectors": self.store.snapshot()["detectors"]})
+            return
         if parsed.path.startswith("/api/incidents/"):
             incident_id = parsed.path.removeprefix("/api/incidents/")
             incident = self.store.get_incident(incident_id)
@@ -610,6 +626,11 @@ class Handler(SimpleHTTPRequestHandler):
                 str(payload.get("note", "")),
             )
             self.write_json({"ok": ok, "message": message, "incident": incident}, status=200 if ok else 400)
+            return
+        if parsed.path == "/api/detectors":
+            payload = self.read_json()
+            ok, message, detectors = self.store.set_enabled_detectors(list(payload.get("enabled_detector_ids", [])))
+            self.write_json({"ok": ok, "message": message, "detectors": detectors}, status=200 if ok else 400)
             return
         if parsed.path == "/api/experiments/apply":
             payload = self.read_json()

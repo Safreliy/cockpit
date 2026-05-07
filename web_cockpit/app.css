@@ -111,6 +111,10 @@ p {
   font-size: 13px;
 }
 
+.stream-control #detectorPicker {
+  max-width: 250px;
+}
+
 .status-band {
   display: grid;
   grid-template-columns: minmax(260px, 1fr) auto auto;
@@ -824,16 +828,30 @@ svg {
 }
 
 .progress-ring {
+  --progress: 0%;
+  position: relative;
   display: grid;
   place-items: center;
   width: 64px;
   height: 64px;
   flex: 0 0 auto;
-  border: 6px solid #d8e8f8;
-  border-top-color: var(--blue);
+  background: conic-gradient(var(--blue) var(--progress), #d8e8f8 0);
   border-radius: 50%;
   color: var(--blue);
   font-weight: 800;
+}
+
+.progress-ring::before {
+  content: "";
+  position: absolute;
+  inset: 7px;
+  background: #fff;
+  border-radius: 50%;
+}
+
+.progress-ring span {
+  position: relative;
+  z-index: 1;
 }
 
 .investigation-list {

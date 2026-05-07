@@ -20,6 +20,8 @@ let incidents = [];
 let operationalEvents = [];
 let experiments = [];
 let experimentSettings = {};
+let detectorCatalog = [];
+let selectedDetectorId = "all";
 let selectedMetric = metricDefs.find((metric) => metric.key === "xact_rate");
 let selectedIncidentId = null;
 let selectedWindow = 900;
@@ -49,6 +51,7 @@ const stopLoad = document.getElementById("stopLoad");
 const loadClients = document.getElementById("loadClients");
 const loadSeconds = document.getElementById("loadSeconds");
 const loadMode = document.getElementById("loadMode");
+const detectorPicker = document.getElementById("detectorPicker");
 const openExperimentLab = document.getElementById("openExperimentLab");
 const openReport = document.getElementById("openReport");
 const drawer = document.getElementById("reportDrawer");
@@ -161,6 +164,9 @@ function ingestSnapshot(snapshot) {
   operationalEvents = snapshot.operational_events ?? [];
   experiments = snapshot.experiments ?? [];
   experimentSettings = snapshot.experiment_settings ?? {};
+  detectorCatalog = snapshot.detectors ?? [];
+  selectedDetectorId = selectedDetectorFromCatalog();
+  renderDetectorPicker();
   renderExperimentSettings();
   renderLoad(snapshot.load);
   retentionState.textContent = `${snapshot.retention?.telemetry_points ?? stream.length} pts`;
@@ -200,6 +206,11 @@ function ingestEvent(event) {
   if (event.type === "load") {
     renderLoad(event.load);
   }
+  if (event.type === "detectors") {
+    detectorCatalog = event.detectors ?? [];
+    selectedDetectorId = selectedDetectorFromCatalog();
+    renderDetectorPicker();
+  }
   if (dragStartX != null) return;
   renderForEvent(event.type);
 }
@@ -215,6 +226,43 @@ function renderLoad(load) {
   stopLoad.disabled = !load.running;
 }
 
+function selectedDetectorFromCatalog() {
+  if (!detectorCatalog.length) return selectedDetectorId;
+  const enabled = detectorCatalog.filter((detector) => detector.enabled);
+  if (!enabled.length || enabled.length === detectorCatalog.length) return "all";
+  if (enabled.length === 1) return enabled[0].id;
+  return "custom";
+}
+
+function detectorLabel() {
+  if (!detectorCatalog.length || selectedDetectorId === "all") return "all";
+  const detector = detectorCatalog.find((item) => item.id === selectedDetectorId);
+  return detector?.name ?? selectedDetectorId;
+}
+
+function renderDetectorPicker() {
+  if (!detectorPicker) return;
+  detectorPicker.innerHTML = "";
+  const allOption = document.createElement("option");
+  allOption.value = "all";
+  allOption.textContent = "All detectors";
+  detectorPicker.appendChild(allOption);
+  if (selectedDetectorId === "custom") {
+    const customOption = document.createElement("option");
+    customOption.value = "custom";
+    customOption.textContent = "Custom selection";
+    customOption.disabled = true;
+    detectorPicker.appendChild(customOption);
+  }
+  detectorCatalog.forEach((detector) => {
+    const option = document.createElement("option");
+    option.value = detector.id;
+    option.textContent = detector.name + " (" + detector.engine + ")";
+    detectorPicker.appendChild(option);
+  });
+  detectorPicker.value = selectedDetectorId;
+}
+
 function renderStatus() {
   sampleCount.textContent = String(stream.length);
   const incident = selectedIncident();
@@ -224,13 +272,13 @@ function renderStatus() {
   if (!openCount) {
     statusBand.classList.add("state-ok");
     statusLabel.textContent = "Live telemetry connected";
-    statusSubtitle.textContent = incidents.length ? "No open incidents. Recent incidents are available for review." : "No current incidents.";
+    statusSubtitle.textContent = (incidents.length ? "No open incidents. Recent incidents are available for review." : "No current incidents.") + " Detector: " + detectorLabel();
     openReport.disabled = !incidents.length;
     return;
   }
   statusBand.classList.add(incident?.severity === "critical" ? "state-bad" : "state-warn");
   statusLabel.textContent = incident.summary;
-  statusSubtitle.textContent = `${openCount} active incident${openCount === 1 ? "" : "s"} - ${incident.status} / ${incident.investigation?.phase ?? "queued"}`;
+  statusSubtitle.textContent = `${openCount} active incident${openCount === 1 ? "" : "s"} - ${incident.status} / ${incident.investigation?.phase ?? "queued"} - Detector: ${detectorLabel()}`;
   openReport.disabled = false;
 }
 
@@ -496,7 +544,7 @@ function renderReport(options = {}) {
     return;
   }
   document.getElementById("reportTitle").textContent = incident.type;
-  const detector = incident.detector ?? { name: "Unknown detector", engine: "unknown", future_engine: "ml_ready" };
+  const detector = incident.detector ?? { name: "Unknown detector", engine: "unknown" };
   const evidenceRows = (incident.evidence ?? []).map((item) => (
     "<tr><td>" + item.metric + "</td><td>" + formatValue(item.value) + "</td><td>" + (item.threshold ?? item.role ?? "") + "</td></tr>"
   )).join("");
@@ -523,9 +571,9 @@ function renderReport(options = {}) {
   document.getElementById("tab-diagnosis").innerHTML =
     '<div class="report-block"><strong>Status</strong><p><span class="status-pill">' + incident.status + "</span> confidence " + formatValue((incident.confidence ?? 0) * 100) + "%</p></div>" +
     '<div class="report-block"><strong>Incident period</strong><p>' + formatClock(incident.started_at ?? incident.created_at) + " - " + formatClock(incident.resolved_at ?? incident.last_seen_at) + " · signals " + (incident.signal_count ?? 1) + " · fingerprint " + (incident.fingerprint ?? incident.type) + '</p></div>' +
-    '<div class="report-block"><strong>Investigation process</strong><div class="investigation-header"><div><span class="status-pill">' + (investigation.state ?? "queued") + '</span><strong>' + (investigation.phase ?? "queued") + '</strong><p>' + (investigation.summary ?? "Waiting for incident evidence.") + '</p></div><div class="progress-ring">' + formatValue(investigation.progress ?? 0) + '%</div></div><ol class="investigation-list">' + investigationSteps + '</ol></div>' +
-    '<div class="report-block"><strong>Inference engine</strong><p>' + (investigation.engine?.mode ?? "hybrid_inference") + " · current: " + (investigation.engine?.current ?? "rules") + " · future: " + (investigation.engine?.future ?? "ml_model_or_ai_agent") + '</p></div>' +
-    '<div class="report-block"><strong>Detector</strong><p>' + detector.name + " · engine: " + detector.engine + " · future: " + detector.future_engine + '</p></div>' +
+    '<div class="report-block"><strong>Investigation process</strong><div class="investigation-header"><div><span class="status-pill">' + (investigation.state ?? "queued") + '</span><strong>' + (investigation.phase ?? "queued") + '</strong><p>' + (investigation.summary ?? "Waiting for incident evidence.") + '</p></div><div class="progress-ring" style="--progress:' + Math.max(0, Math.min(100, investigation.progress ?? 0)) + '%"><span>' + formatValue(investigation.progress ?? 0) + '%</span></div></div><ol class="investigation-list">' + investigationSteps + '</ol></div>' +
+    '<div class="report-block"><strong>Inference engine</strong><p>' + (investigation.engine?.mode ?? "hybrid inference") + " · " + (investigation.engine?.current ?? "active detector pipeline") + '</p></div>' +
+    '<div class="report-block"><strong>Detector</strong><p>' + detector.name + " · engine: " + detector.engine + '</p></div>' +
     '<div class="report-block"><strong>Detected metric</strong><p>' + incident.metric + " = " + formatValue(incident.value) + " threshold " + formatValue(incident.threshold) + '</p></div>' +
     '<div class="report-block"><strong>Time window</strong><p>' + formatClock(incident.created_at) + " - " + formatClock(incident.last_seen_at) + " · samples " + incident.sample_count + '</p></div>' +
     '<div class="report-block"><strong>Interpretation</strong><p>' + incident.summary + '</p></div>' +
@@ -595,6 +643,10 @@ function renderForEvent(type) {
     return;
   }
   if (type === "load") {
+    renderStatus();
+    return;
+  }
+  if (type === "detectors") {
     renderStatus();
     return;
   }
@@ -680,6 +732,23 @@ stopLoad.addEventListener("click", async () => {
     await postJson("/api/load/stop", {});
   } catch (error) {
     statusSubtitle.textContent = error.message;
+  }
+});
+
+detectorPicker.addEventListener("change", async () => {
+  selectedDetectorId = detectorPicker.value;
+  detectorPicker.disabled = true;
+  try {
+    const enabled = selectedDetectorId === "all" ? [] : [selectedDetectorId];
+    const data = await postJson("/api/detectors", { enabled_detector_ids: enabled });
+    detectorCatalog = data.detectors ?? detectorCatalog;
+    selectedDetectorId = selectedDetectorFromCatalog();
+    renderDetectorPicker();
+    renderStatus();
+  } catch (error) {
+    statusSubtitle.textContent = error.message;
+  } finally {
+    detectorPicker.disabled = false;
   }
 });
 

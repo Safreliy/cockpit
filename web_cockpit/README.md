@@ -25,6 +25,7 @@ The live UI consumes:
 - `/api/incidents/:id`
 - `/api/load/start`
 - `/api/load/stop`
+- `/api/detectors`
 - `/api/experiments/apply`
 - `/api/experiments/rollback`
 - `/events` over Server-Sent Events

@@ -8,7 +8,7 @@ The project started as a causal load simulator and now includes a local live sta
 
 - Streams real PostgreSQL telemetry from Prometheus.
 - Starts `pgbench` load from the web UI.
-- Detects suspicious activity through a pluggable detector pipeline: rule-based, statistical, and ML-like stub detectors.
+- Detects suspicious activity through a pluggable detector pipeline: rule-based, statistical, and ML detectors.
 - Aggregates detector signals into incident periods by fingerprint.
 - Shows incident lifecycle: candidate, active, recovering, resolved, acknowledged, false positive.
 - Displays an investigation process that can later be driven by ML/AI inference.

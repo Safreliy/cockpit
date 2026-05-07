@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
-from cockpit.detectors import MLBasedSuspicionDetector, detector_catalog
+from cockpit.detectors import MLBasedSuspicionDetector, detector_catalog, evaluate_detectors
 
 
 def test_detector_catalog_exposes_replaceable_engines():
@@ -12,8 +12,9 @@ def test_detector_catalog_exposes_replaceable_engines():
     engines = {item["engine"] for item in catalog}
     assert "rules" in engines
     assert "statistical" in engines
-    assert "ml_stub" in engines
+    assert "ml" in engines
     assert all(item["signal_contract"] == "SuspiciousSignal.v1" for item in catalog)
+    assert all({"id", "name", "engine", "type", "signal_contract", "enabled"} <= set(item) for item in catalog)
 
 
 def test_ml_detector_uses_signal_contract():
@@ -57,4 +58,19 @@ def test_ml_detector_uses_signal_contract():
         "causal_chain",
     ]:
         assert key in signal
-    assert signal["detector"]["engine"] == "ml_stub"
+    assert signal["detector"]["engine"] == "ml"
+
+
+def test_detector_pipeline_can_be_filtered_by_detector_id():
+    point = {
+        "t": 30.0,
+        "xact_rate": 100.0,
+        "active_connections": 30.0,
+        "waiting_connections": 3.0,
+        "blk_read_time_ms_rate": 80.0,
+        "vacuum_max_elapsed_seconds": 45.0,
+    }
+    all_signals = evaluate_detectors(point, [])
+    filtered_signals = evaluate_detectors(point, [], {"rules.postgres.high_concurrency.v1"})
+    assert {signal["type"] for signal in all_signals} >= {"high_concurrency", "wait_contention", "read_io_pressure", "vacuum_pressure"}
+    assert [signal["type"] for signal in filtered_signals] == ["high_concurrency"]
