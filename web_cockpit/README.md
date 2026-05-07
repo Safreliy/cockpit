@@ -23,7 +23,6 @@ The live UI consumes:
 
 - `/api/snapshot`
 - `/api/incidents/:id`
-- `/api/incidents/infer`
 - `/api/load/start`
 - `/api/load/stop`
 - `/api/detectors`
@@ -32,8 +31,6 @@ The live UI consumes:
 - `/events` over Server-Sent Events
 
 `Benchmark lab` currently runs pgbench workloads with configurable clients, jobs, duration, mode, target TPS, and profiles for default TPS, read-only, planner range scans, sort pressure, aggregate scans, and write-path pressure. The UI keeps the workload engine explicit so additional generators can be added behind the same controls.
-
-`Run AI inference` starts the optional causal agent for the selected incident. The backend reads `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY`; if no key is configured, the agent falls back to a deterministic local verdict so the interface remains testable.
 
 ## Replay UI
 
