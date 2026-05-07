@@ -11,7 +11,7 @@ import time
 from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from live_pg_monitor import QUERIES, query_prometheus, query_settings
@@ -249,13 +249,40 @@ def signal_fingerprint(signal_type: str, entity: str = "postgres:cockpit") -> st
     return f"{entity}:{signal_type}"
 
 
-def evaluate_detectors(point: dict[str, float], history: list[dict[str, float]] | None = None) -> list[dict[str, Any]]:
-    signals: list[dict[str, Any]] = []
-    for detector in DETECTORS:
+class SignalDetector(Protocol):
+    def describe(self) -> dict[str, Any]:
+        ...
+
+    def detect(self, point: dict[str, float], history: list[dict[str, float]]) -> list[dict[str, Any]]:
+        ...
+
+
+def enrich_signal(signal: dict[str, Any], point: dict[str, float]) -> dict[str, Any]:
+    signal["hypotheses"] = build_hypotheses(signal, point)
+    signal["causal_chain"] = build_causal_chain(signal)
+    return signal
+
+
+class RuleThresholdDetector:
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "id": self.config["id"],
+            "name": self.config["name"],
+            "engine": self.config["engine"],
+            "future_engine": self.config["future_engine"],
+            "type": self.config["type"],
+            "signal_contract": "SuspiciousSignal.v1",
+        }
+
+    def detect(self, point: dict[str, float], history: list[dict[str, float]]) -> list[dict[str, Any]]:
+        detector = self.config
         value = point.get(detector["metric"], 0)
         threshold = detector["threshold"]
         if value < threshold:
-            continue
+            return []
         signal = {
             "id": f"sig-{detector['type']}-{int(point['t'])}",
             "t": int(point["t"]),
@@ -291,69 +318,176 @@ def evaluate_detectors(point: dict[str, float], history: list[dict[str, float]] 
                 {"metric": "config_reload_time", "value": point.get("config_reload_time", 0), "role": "operational_context"},
             ],
         }
-        signal["hypotheses"] = build_hypotheses(signal, point)
-        signal["causal_chain"] = build_causal_chain(signal)
-        signals.append(signal)
-    signals.extend(evaluate_baseline_signals(point, history or []))
-    return signals
+        return [enrich_signal(signal, point)]
 
 
-def evaluate_baseline_signals(point: dict[str, float], history: list[dict[str, float]]) -> list[dict[str, Any]]:
-    if len(history) < 12:
-        return []
-    baseline_window = history[-30:]
-    xact_values = [item.get("xact_rate", 0) for item in baseline_window]
-    avg_xact = sum(xact_values) / len(xact_values)
-    if avg_xact <= 10:
-        return []
-    current = point.get("xact_rate", 0)
-    if current >= avg_xact * 0.45:
-        return []
-    signal = {
-        "id": f"sig-throughput_drop-{int(point['t'])}",
-        "t": int(point["t"]),
-        "type": "throughput_drop",
-        "fingerprint": signal_fingerprint("throughput_drop"),
-        "severity": "warning",
-        "metric": "xact_rate",
-        "value": current,
-        "threshold": round(avg_xact * 0.45, 3),
-        "recover_threshold": round(avg_xact * 0.75, 3),
-        "confirmations": 2,
-        "recovery_samples": 4,
-        "cooldown_seconds": 180,
-        "summary": "Transaction throughput dropped significantly versus the recent baseline.",
-        "candidate_root": "workload_stall_or_resource_contention",
-        "confidence": 0.68,
-        "score": round(1 - (current / avg_xact), 2),
-        "source": "baseline_deviation_detector",
-        "detector": {
+class StatisticalBaselineDetector:
+    def describe(self) -> dict[str, Any]:
+        return {
             "id": "stats.postgres.throughput_drop.v1",
             "name": "Throughput baseline detector",
             "engine": "statistical",
             "future_engine": "ml_ready",
-        },
-        "evidence": [
-            {"metric": "xact_rate", "value": current, "baseline": round(avg_xact, 3), "role": "baseline_deviation"},
-            {"metric": "active_connections", "value": point.get("active_connections", 0), "role": "context"},
-            {"metric": "waiting_connections", "value": point.get("waiting_connections", 0), "role": "context"},
-            {"metric": "vacuum_max_elapsed_seconds", "value": point.get("vacuum_max_elapsed_seconds", 0), "role": "operational_context"},
-        ],
-    }
-    signal["hypotheses"] = [
-        {
-            "cause": "resource_contention_or_blocking",
-            "score": 0.65,
-            "why": "Throughput fell compared with a recent baseline; waits, IO, VACUUM, and config changes should be checked.",
-        },
-        {
-            "cause": "workload_shape_change",
-            "score": 0.42,
-            "why": "A workload transition can reduce transaction rate without a direct database fault.",
-        },
-    ]
-    signal["causal_chain"] = build_causal_chain(signal)
-    return [signal]
+            "type": "throughput_drop",
+            "signal_contract": "SuspiciousSignal.v1",
+        }
+
+    def detect(self, point: dict[str, float], history: list[dict[str, float]]) -> list[dict[str, Any]]:
+        if len(history) < 12:
+            return []
+        baseline_window = history[-30:]
+        xact_values = [item.get("xact_rate", 0) for item in baseline_window]
+        avg_xact = sum(xact_values) / len(xact_values)
+        if avg_xact <= 10:
+            return []
+        current = point.get("xact_rate", 0)
+        if current >= avg_xact * 0.45:
+            return []
+        signal = {
+            "id": f"sig-throughput_drop-{int(point['t'])}",
+            "t": int(point["t"]),
+            "type": "throughput_drop",
+            "fingerprint": signal_fingerprint("throughput_drop"),
+            "severity": "warning",
+            "metric": "xact_rate",
+            "value": current,
+            "threshold": round(avg_xact * 0.45, 3),
+            "recover_threshold": round(avg_xact * 0.75, 3),
+            "confirmations": 2,
+            "recovery_samples": 4,
+            "cooldown_seconds": 180,
+            "summary": "Transaction throughput dropped significantly versus the recent baseline.",
+            "candidate_root": "workload_stall_or_resource_contention",
+            "confidence": 0.68,
+            "score": round(1 - (current / avg_xact), 2),
+            "source": "baseline_deviation_detector",
+            "detector": self.describe(),
+            "evidence": [
+                {"metric": "xact_rate", "value": current, "baseline": round(avg_xact, 3), "role": "baseline_deviation"},
+                {"metric": "active_connections", "value": point.get("active_connections", 0), "role": "context"},
+                {"metric": "waiting_connections", "value": point.get("waiting_connections", 0), "role": "context"},
+                {"metric": "vacuum_max_elapsed_seconds", "value": point.get("vacuum_max_elapsed_seconds", 0), "role": "operational_context"},
+            ],
+            "hypotheses": [
+                {
+                    "cause": "resource_contention_or_blocking",
+                    "score": 0.65,
+                    "why": "Throughput fell compared with a recent baseline; waits, IO, VACUUM, and config changes should be checked.",
+                },
+                {
+                    "cause": "workload_shape_change",
+                    "score": 0.42,
+                    "why": "A workload transition can reduce transaction rate without a direct database fault.",
+                },
+            ],
+        }
+        signal["causal_chain"] = build_causal_chain(signal)
+        return [signal]
+
+
+class MLBasedSuspicionDetector:
+    def describe(self) -> dict[str, Any]:
+        return {
+            "id": "ml.postgres.suspicious_activity.v0",
+            "name": "ML-like suspicious activity detector",
+            "engine": "ml_stub",
+            "future_engine": "ml_model_or_ai_agent",
+            "type": "ml_suspicious_activity",
+            "signal_contract": "SuspiciousSignal.v1",
+        }
+
+    def detect(self, point: dict[str, float], history: list[dict[str, float]]) -> list[dict[str, Any]]:
+        if len(history) < 15:
+            return []
+        baseline = history[-45:]
+        features = self.features(point, baseline)
+        score = round(
+            min(
+                1.0,
+                features["active_pressure"] * 0.22
+                + features["wait_pressure"] * 0.22
+                + features["io_pressure"] * 0.2
+                + features["vacuum_pressure"] * 0.16
+                + features["throughput_drop"] * 0.2,
+            ),
+            2,
+        )
+        if score < 0.72:
+            return []
+        signal = {
+            "id": f"sig-ml_suspicious_activity-{int(point['t'])}",
+            "t": int(point["t"]),
+            "type": "ml_suspicious_activity",
+            "fingerprint": signal_fingerprint("ml_suspicious_activity"),
+            "severity": "critical" if score >= 0.9 else "warning",
+            "metric": "ml_anomaly_score",
+            "value": score,
+            "threshold": 0.72,
+            "recover_threshold": 0.45,
+            "confirmations": 2,
+            "recovery_samples": 4,
+            "cooldown_seconds": 180,
+            "summary": "ML-like detector found a suspicious multi-metric pattern.",
+            "candidate_root": "multi_signal_resource_contention",
+            "confidence": round(min(0.95, 0.5 + score * 0.45), 2),
+            "score": score,
+            "source": "ml_like_detector",
+            "detector": self.describe(),
+            "model": {
+                "kind": "heuristic_ml_stub",
+                "version": "0",
+                "replaceable_with": "real anomaly model that returns SuspiciousSignal.v1",
+            },
+            "evidence": [
+                {"metric": name, "value": value, "role": "ml_feature"}
+                for name, value in features.items()
+            ],
+            "hypotheses": [
+                {
+                    "cause": "compound_resource_contention",
+                    "score": score,
+                    "why": "Several weak signals jointly look suspicious even when a single threshold is not decisive.",
+                },
+                {
+                    "cause": "dba_or_maintenance_induced_degradation",
+                    "score": round(max(features["vacuum_pressure"], features["io_pressure"]), 2),
+                    "why": "Maintenance and IO features contribute to the anomaly score.",
+                },
+            ],
+        }
+        signal["causal_chain"] = build_causal_chain(signal)
+        return [signal]
+
+    def features(self, point: dict[str, float], baseline: list[dict[str, float]]) -> dict[str, float]:
+        avg_xact = sum(item.get("xact_rate", 0) for item in baseline) / len(baseline)
+        current_xact = point.get("xact_rate", 0)
+        throughput_drop = 0.0 if avg_xact <= 10 else max(0.0, min(1.0, 1 - current_xact / avg_xact))
+        return {
+            "active_pressure": min(1.0, point.get("active_connections", 0) / 24),
+            "wait_pressure": min(1.0, point.get("waiting_connections", 0) / 2),
+            "io_pressure": min(1.0, point.get("blk_read_time_ms_rate", 0) / 50),
+            "vacuum_pressure": min(1.0, point.get("vacuum_max_elapsed_seconds", 0) / 30),
+            "throughput_drop": round(throughput_drop, 2),
+        }
+
+
+DETECTOR_PIPELINE: list[SignalDetector] = [
+    *(RuleThresholdDetector(config) for config in DETECTORS),
+    StatisticalBaselineDetector(),
+    MLBasedSuspicionDetector(),
+]
+
+
+def detector_catalog() -> list[dict[str, Any]]:
+    return [detector.describe() for detector in DETECTOR_PIPELINE]
+
+
+def evaluate_detectors(point: dict[str, float], history: list[dict[str, float]] | None = None) -> list[dict[str, Any]]:
+    history = history or []
+    signals: list[dict[str, Any]] = []
+    for detector in DETECTOR_PIPELINE:
+        signals.extend(detector.detect(point, history))
+    return signals
 
 
 class TelemetryStore:
@@ -747,7 +881,7 @@ class TelemetryStore:
                 "settings": self.settings,
                 "experiments": list(self.experiments),
                 "experiment_settings": EXPERIMENT_SETTINGS,
-                "detectors": DETECTORS,
+                "detectors": detector_catalog(),
                 "load": self.load_status_locked(),
                 "retention": {
                     "telemetry_points": self.points.maxlen,
