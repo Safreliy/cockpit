@@ -7,7 +7,7 @@ The project started as a causal load simulator and now includes a local live sta
 ## What It Does
 
 - Streams real PostgreSQL telemetry from Prometheus.
-- Starts configurable benchmark workloads from the web UI, including pgbench clients, jobs, duration, mode, and target TPS.
+- Starts configurable benchmark workloads from the web UI, including pgbench clients, jobs, duration, mode, target TPS, and planner/sort/update profiles.
 - Detects suspicious activity through a pluggable detector pipeline: rule-based, statistical, and ML detectors.
 - Aggregates detector signals into incident periods by fingerprint.
 - Shows incident lifecycle: candidate, active, recovering, resolved, acknowledged, false positive.

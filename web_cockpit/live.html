@@ -150,7 +150,22 @@
           <option value="steady">Steady TPS</option>
           <option value="burst">Burst pressure</option>
           <option value="readonly">Read-only scan</option>
+          <option value="planner">Planner sensitivity</option>
+          <option value="sort">Sort / work_mem pressure</option>
+          <option value="aggregate">Aggregate scan</option>
+          <option value="update">Write path</option>
           <option value="custom" selected>Custom</option>
+        </select>
+      </label>
+      <label>
+        Script
+        <select id="benchmarkScript">
+          <option value="default">pgbench default</option>
+          <option value="select_only">select only</option>
+          <option value="simple_update">simple update</option>
+          <option value="planner_range">planner range scan</option>
+          <option value="sort_spill">sort pressure</option>
+          <option value="aggregate_scan">aggregate scan</option>
         </select>
       </label>
       <label>

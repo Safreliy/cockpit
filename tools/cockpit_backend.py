@@ -6,6 +6,7 @@ import os
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -22,6 +23,20 @@ from live_pg_monitor import QUERIES, query_prometheus, query_settings
 ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = ROOT / "web_cockpit"
 COMPOSE_FILE = ROOT / "infra" / "docker-compose.yml"
+
+
+PGBENCH_CUSTOM_SCRIPTS = {
+    "planner_range": """
+\\set range_start random(1, 900000)
+SELECT count(*) FROM pgbench_accounts WHERE aid BETWEEN :range_start AND :range_start + 100000;
+""",
+    "sort_spill": """
+SELECT aid, abalance FROM pgbench_accounts ORDER BY abalance, aid LIMIT 5000;
+""",
+    "aggregate_scan": """
+SELECT bid, sum(abalance), avg(abalance) FROM pgbench_accounts GROUP BY bid ORDER BY bid;
+""",
+}
 
 
 class TelemetryStore:
@@ -43,6 +58,7 @@ class TelemetryStore:
         self.load_started_at: int | None = None
         self.load_config: dict[str, Any] | None = None
         self.load_output: deque[str] = deque(maxlen=40)
+        self.load_script_path: str | None = None
         self.enabled_detector_ids: set[str] | None = None
 
     def add_point(self, point: dict[str, float]) -> None:
@@ -481,6 +497,7 @@ class TelemetryStore:
             self.load_process = process
             self.load_started_at = int(time.time())
             self.load_config = workload
+            self.load_script_path = workload.get("script_path")
             self.load_output.clear()
             self._publish_locked({"type": "load", "load": self.load_status_locked()})
         threading.Thread(target=self.capture_load_output, args=(process,), daemon=True).start()
@@ -494,6 +511,14 @@ class TelemetryStore:
                 self.load_output.append(line.rstrip())
         process.wait()
         with self.lock:
+            script_path = self.load_script_path
+            self.load_script_path = None
+        if script_path:
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        with self.lock:
             self._publish_locked({"type": "load", "load": self.load_status_locked()})
 
     def workload_args(self, config: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
@@ -505,15 +530,22 @@ class TelemetryStore:
         seconds = max(1, min(86400, int(config.get("seconds", 60))))
         mode = str(config.get("mode", "mixed"))
         rate = max(0, min(100000, int(config.get("rate", 0))))
+        script = str(config.get("script", "default"))
         workload = {
             "engine": engine,
             "profile": str(config.get("profile", "custom")),
+            "script": script,
             "clients": clients,
             "jobs": jobs,
             "seconds": seconds,
             "mode": mode,
             "rate": rate,
         }
+        if script in PGBENCH_CUSTOM_SCRIPTS:
+            script_file = tempfile.NamedTemporaryFile("w", delete=False, suffix=f"-{script}.sql", encoding="utf-8")
+            script_file.write(PGBENCH_CUSTOM_SCRIPTS[script].strip() + "\n")
+            script_file.close()
+            workload["script_path"] = script_file.name
         return self.pgbench_args(workload), workload
 
     def pgbench_args(self, workload: dict[str, Any]) -> list[str]:
@@ -522,6 +554,8 @@ class TelemetryStore:
         seconds = int(workload["seconds"])
         mode = str(workload["mode"])
         rate = int(workload.get("rate", 0))
+        script = str(workload.get("script", "default"))
+        script_path = str(workload.get("script_path", ""))
         pgbench = shutil.which("pgbench")
         if pgbench:
             args = [
@@ -543,7 +577,11 @@ class TelemetryStore:
             ]
             if rate > 0:
                 args += ["-R", str(rate)]
-            if mode == "readonly":
+            if script_path:
+                args += ["-f", script_path]
+            elif script == "simple_update":
+                args += ["-b", "simple-update"]
+            elif script == "select_only" or mode == "readonly":
                 args.append("-S")
             args.append(os.environ.get("PGDATABASE", "cockpit"))
             return args
@@ -557,11 +595,13 @@ class TelemetryStore:
             "postgres",
             "pgbench",
         ]
-        if mode == "readonly":
-            args.append("-S")
         args += ["-c", str(clients), "-j", str(jobs), "-T", str(seconds), "-P", "5"]
         if rate > 0:
             args += ["-R", str(rate)]
+        if script == "simple_update":
+            args += ["-b", "simple-update"]
+        elif script == "select_only" or mode == "readonly":
+            args.append("-S")
         args += ["-U", "cockpit", "cockpit"]
         return args
 
@@ -576,16 +616,26 @@ class TelemetryStore:
         except subprocess.TimeoutExpired:
             process.kill()
         with self.lock:
+            script_path = self.load_script_path
+            self.load_script_path = None
+        if script_path:
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        with self.lock:
             self._publish_locked({"type": "load", "load": self.load_status_locked()})
         return True, "stopped"
 
     def load_status_locked(self) -> dict[str, Any]:
         running = bool(self.load_process and self.load_process.poll() is None)
+        config = dict(self.load_config or {})
+        config.pop("script_path", None)
         return {
             "running": running,
             "started_at": self.load_started_at if running else None,
             "returncode": None if running or not self.load_process else self.load_process.returncode,
-            "config": self.load_config,
+            "config": config or None,
             "output": list(self.load_output)[-10:],
         }
 

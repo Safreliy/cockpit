@@ -56,6 +56,7 @@ const loadRate = document.getElementById("loadRate");
 const loadMode = document.getElementById("loadMode");
 const benchmarkEngine = document.getElementById("benchmarkEngine");
 const benchmarkProfile = document.getElementById("benchmarkProfile");
+const benchmarkScript = document.getElementById("benchmarkScript");
 const openBenchmarkLab = document.getElementById("openBenchmarkLab");
 const benchmarkDrawer = document.getElementById("benchmarkDrawer");
 const benchmarkBackdrop = document.getElementById("benchmarkBackdrop");
@@ -748,22 +749,53 @@ function applyBenchmarkProfile() {
   const profile = benchmarkProfile.value;
   if (profile === "steady") {
     loadMode.value = "mixed";
+    benchmarkScript.value = "default";
     loadClients.value = 24;
     loadJobs.value = 4;
     loadSeconds.value = 900;
     loadRate.value = 300;
   } else if (profile === "burst") {
     loadMode.value = "mixed";
+    benchmarkScript.value = "default";
     loadClients.value = 96;
     loadJobs.value = 8;
     loadSeconds.value = 180;
     loadRate.value = 0;
   } else if (profile === "readonly") {
     loadMode.value = "readonly";
+    benchmarkScript.value = "select_only";
     loadClients.value = 48;
     loadJobs.value = 6;
     loadSeconds.value = 600;
     loadRate.value = 500;
+  } else if (profile === "planner") {
+    loadMode.value = "readonly";
+    benchmarkScript.value = "planner_range";
+    loadClients.value = 16;
+    loadJobs.value = 4;
+    loadSeconds.value = 600;
+    loadRate.value = 40;
+  } else if (profile === "sort") {
+    loadMode.value = "readonly";
+    benchmarkScript.value = "sort_spill";
+    loadClients.value = 8;
+    loadJobs.value = 4;
+    loadSeconds.value = 600;
+    loadRate.value = 20;
+  } else if (profile === "aggregate") {
+    loadMode.value = "readonly";
+    benchmarkScript.value = "aggregate_scan";
+    loadClients.value = 8;
+    loadJobs.value = 4;
+    loadSeconds.value = 600;
+    loadRate.value = 30;
+  } else if (profile === "update") {
+    loadMode.value = "mixed";
+    benchmarkScript.value = "simple_update";
+    loadClients.value = 32;
+    loadJobs.value = 4;
+    loadSeconds.value = 600;
+    loadRate.value = 200;
   }
 }
 
@@ -771,6 +803,7 @@ function benchmarkPayload() {
   return {
     engine: benchmarkEngine.value,
     profile: benchmarkProfile.value,
+    script: benchmarkScript.value,
     clients: Number(loadClients.value),
     jobs: Number(loadJobs.value),
     seconds: Number(loadSeconds.value),

@@ -30,7 +30,7 @@ The live UI consumes:
 - `/api/experiments/rollback`
 - `/events` over Server-Sent Events
 
-`Benchmark lab` currently runs pgbench workloads with configurable clients, jobs, duration, mode, and target TPS. The UI keeps the workload engine explicit so additional generators can be added behind the same controls.
+`Benchmark lab` currently runs pgbench workloads with configurable clients, jobs, duration, mode, target TPS, and profiles for default TPS, read-only, planner range scans, sort pressure, aggregate scans, and write-path pressure. The UI keeps the workload engine explicit so additional generators can be added behind the same controls.
 
 ## Replay UI
 

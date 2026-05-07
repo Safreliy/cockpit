@@ -54,4 +54,6 @@ def test_run_generates_all_mvp_artifacts():
     live_html = Path("web_cockpit/live.html").read_text(encoding="utf-8")
     assert "Benchmark lab" in live_html
     assert "Target TPS" in live_html
+    assert "planner range scan" in live_html
+    assert "sort pressure" in live_html
     assert Path("tools/cockpit_backend.py").exists()
