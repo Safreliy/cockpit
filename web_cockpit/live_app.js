@@ -1,0 +1,421 @@
+const metricDefs = [
+  { key: "active_connections", label: "Active connections", unit: "", threshold: 24 },
+  { key: "waiting_connections", label: "Waiting connections", unit: "", threshold: 2 },
+  { key: "connections", label: "Connections", unit: "" },
+  { key: "xact_rate", label: "Transaction rate", unit: "/s" },
+  { key: "read_blocks_rate", label: "Read blocks", unit: "/s" },
+  { key: "cache_hit_rate", label: "Cache hits", unit: "/s" },
+  { key: "blk_read_time_ms_rate", label: "Read time", unit: "ms/s", threshold: 50 }
+];
+
+const API_BASE = location.protocol === "file:" ? "http://127.0.0.1:8088" : "";
+
+let stream = [];
+let detections = [];
+let incidents = [];
+let selectedMetric = metricDefs.find((metric) => metric.key === "xact_rate");
+let selectedIncidentId = null;
+
+const statusBand = document.getElementById("statusBand");
+const statusLabel = document.getElementById("statusLabel");
+const statusSubtitle = document.getElementById("statusSubtitle");
+const sampleCount = document.getElementById("sampleCount");
+const loadState = document.getElementById("loadState");
+const retentionState = document.getElementById("retentionState");
+const metricPicker = document.getElementById("metricPicker");
+const chart = document.getElementById("liveChart");
+const metricsStrip = document.getElementById("metricsStrip");
+const incidentSteps = document.getElementById("incidentSteps");
+const startLoad = document.getElementById("startLoad");
+const stopLoad = document.getElementById("stopLoad");
+const loadClients = document.getElementById("loadClients");
+const loadSeconds = document.getElementById("loadSeconds");
+const loadMode = document.getElementById("loadMode");
+const openReport = document.getElementById("openReport");
+const drawer = document.getElementById("reportDrawer");
+const backdrop = document.getElementById("drawerBackdrop");
+const closeReport = document.getElementById("closeReport");
+const statusActions = document.querySelectorAll(".status-action");
+const refreshIncident = document.getElementById("refreshIncident");
+
+function formatValue(value) {
+  if (value == null) return "--";
+  if (Math.abs(value) >= 100) return value.toFixed(0);
+  if (Math.abs(value) >= 10) return value.toFixed(1);
+  return value.toFixed(2);
+}
+
+function formatClock(epochSeconds) {
+  if (!epochSeconds) return "--";
+  return new Date(epochSeconds * 1000).toLocaleTimeString();
+}
+
+function scale(value, min, max, outMin, outMax) {
+  if (max === min) return (outMin + outMax) / 2;
+  return outMin + ((value - min) * (outMax - outMin)) / (max - min);
+}
+
+function selectedIncident() {
+  return incidents.find((item) => item.id === selectedIncidentId) ?? incidents.find((item) => item.status === "open") ?? incidents.at(-1) ?? null;
+}
+
+function renderMetricPicker() {
+  metricPicker.innerHTML = "";
+  metricDefs.forEach((metric) => {
+    const option = document.createElement("option");
+    option.value = metric.key;
+    option.textContent = metric.label;
+    metricPicker.appendChild(option);
+  });
+  metricPicker.value = selectedMetric.key;
+}
+
+function normalizeDetection(detection) {
+  return {
+    id: detection.id ?? detection.type + "-" + detection.t,
+    ...detection
+  };
+}
+
+function normalizeIncident(incident) {
+  return {
+    id: incident.id ?? "inc-" + incident.type + "-" + incident.created_at,
+    ...incident
+  };
+}
+
+function upsertIncident(incident) {
+  const normalized = normalizeIncident(incident);
+  const index = incidents.findIndex((item) => item.id === normalized.id);
+  if (index >= 0) {
+    incidents[index] = normalized;
+  } else {
+    incidents.push(normalized);
+    incidents = incidents.slice(-200);
+  }
+  return normalized;
+}
+
+function ingestSnapshot(snapshot) {
+  stream = snapshot.stream ?? [];
+  detections = (snapshot.detections ?? []).map(normalizeDetection);
+  incidents = (snapshot.incidents ?? []).map(normalizeIncident);
+  renderLoad(snapshot.load);
+  retentionState.textContent = `${snapshot.retention?.telemetry_points ?? stream.length} pts`;
+  render();
+}
+
+function ingestEvent(event) {
+  if (event.type === "snapshot") {
+    ingestSnapshot(event.snapshot);
+    return;
+  }
+  if (event.type === "telemetry") {
+    stream.push(event.point);
+    stream = stream.slice(-720);
+  }
+  if (event.type === "detection") {
+    detections.push(normalizeDetection(event.detection));
+    detections = detections.slice(-200);
+  }
+  if (event.type === "incident") {
+    const incident = upsertIncident(event.incident);
+    selectedIncidentId = incident.id;
+  }
+  if (event.type === "load") {
+    renderLoad(event.load);
+  }
+  render();
+}
+
+function renderLoad(load) {
+  if (!load) return;
+  loadState.textContent = load.running ? "running" : "idle";
+  if (!load.running && load.returncode != null && load.returncode !== 0) {
+    loadState.textContent = "failed";
+    statusSubtitle.textContent = (load.output ?? []).at(-1) ?? "Load finished with an error.";
+  }
+  startLoad.disabled = load.running;
+  stopLoad.disabled = !load.running;
+}
+
+function renderStatus() {
+  sampleCount.textContent = String(stream.length);
+  const incident = selectedIncident();
+  const openCount = incidents.filter((item) => item.status === "open").length;
+  statusBand.classList.remove("state-ok", "state-warn", "state-bad");
+  if (!openCount) {
+    statusBand.classList.add("state-ok");
+    statusLabel.textContent = "Live telemetry connected";
+    statusSubtitle.textContent = incidents.length ? "No open incidents. Recent incidents are available for review." : "No current incidents.";
+    openReport.disabled = !incidents.length;
+    return;
+  }
+  statusBand.classList.add(incident?.severity === "critical" ? "state-bad" : "state-warn");
+  statusLabel.textContent = incident.summary;
+  statusSubtitle.textContent = `${openCount} open incident${openCount === 1 ? "" : "s"} - investigation ${incident.investigation?.phase ?? "queued"}`;
+  openReport.disabled = false;
+}
+
+function renderChart() {
+  const width = 860;
+  const height = 320;
+  const margin = { left: 52, right: 20, top: 24, bottom: 38 };
+  const x1 = margin.left;
+  const x2 = width - margin.right;
+  const y1 = height - margin.bottom;
+  const y2 = margin.top;
+  if (!stream.length) {
+    chart.innerHTML = '<rect width="860" height="320" fill="#fff"></rect><text x="52" y="160" fill="#607080">Waiting for telemetry...</text>';
+    return;
+  }
+  const visibleStream = stream.slice(-180);
+  const values = visibleStream.map((point) => point[selectedMetric.key] ?? 0);
+  const threshold = selectedMetric.threshold;
+  const min = Math.min(...values, threshold ?? Infinity);
+  const max = Math.max(...values, threshold ?? -Infinity);
+  const span = max - min || 1;
+  const yMin = min - span * 0.08;
+  const yMax = max + span * 0.12;
+  const firstT = visibleStream[0].t;
+  const lastT = visibleStream.at(-1).t;
+  const points = visibleStream
+    .map((point) => {
+      const x = scale(point.t, firstT, lastT, x1, x2);
+      const y = scale(point[selectedMetric.key] ?? 0, yMin, yMax, y1, y2);
+      return x.toFixed(1) + "," + y.toFixed(1);
+    })
+    .join(" ");
+  const thresholdY = threshold == null ? "" : '<line class="threshold" x1="' + x1 + '" x2="' + x2 + '" y1="' + scale(threshold, yMin, yMax, y1, y2) + '" y2="' + scale(threshold, yMin, yMax, y1, y2) + '"></line>';
+  const markers = incidents
+    .map((incident) => {
+      const markerT = incident.last_seen_at ?? incident.created_at;
+      if (markerT < firstT || markerT > lastT) return "";
+      const point = stream.reduce((best, item) => Math.abs(item.t - markerT) < Math.abs(best.t - markerT) ? item : best, stream[0]);
+      const x = scale(markerT, firstT, lastT, x1, x2);
+      const y = scale(point[selectedMetric.key] ?? 0, yMin, yMax, y1, y2);
+      const active = selectedIncident()?.id === incident.id ? " selected" : "";
+      const resolved = incident.status === "resolved" || incident.status === "false_positive" ? " resolved" : "";
+      return '<g class="incident-marker' + active + resolved + '" data-incident-id="' + incident.id + '" role="button" tabindex="0"><rect class="incident-band" x="' + (x - 12) + '" y="' + y2 + '" width="24" height="' + (y1 - y2) + '"></rect><line class="anomaly-line" x1="' + x + '" x2="' + x + '" y1="' + y2 + '" y2="' + y1 + '"></line><circle class="anomaly-dot" cx="' + x + '" cy="' + y + '" r="7"></circle><circle class="anomaly-hit" cx="' + x + '" cy="' + y + '" r="18"></circle></g>';
+    })
+    .join("");
+  chart.innerHTML =
+    '<rect width="' + width + '" height="' + height + '" fill="#fff"></rect>' +
+    '<line class="axis" x1="' + x1 + '" x2="' + x2 + '" y1="' + y1 + '" y2="' + y1 + '"></line>' +
+    '<line class="axis" x1="' + x1 + '" x2="' + x1 + '" y1="' + y1 + '" y2="' + y2 + '"></line>' +
+    thresholdY +
+    '<polyline class="series" points="' + points + '"></polyline>' +
+    markers +
+    '<text x="' + x1 + '" y="18" fill="#17202a" font-size="13" font-weight="700">' + selectedMetric.label + ": " + formatValue(stream.at(-1)[selectedMetric.key]) + " " + selectedMetric.unit + '</text>' +
+    '<text x="8" y="' + (y2 + 4) + '" fill="#607080" font-size="12">' + formatValue(yMax) + '</text>' +
+    '<text x="8" y="' + y1 + '" fill="#607080" font-size="12">' + formatValue(yMin) + '</text>';
+  chart.querySelectorAll(".incident-marker").forEach((marker) => {
+    marker.addEventListener("click", () => selectIncident(marker.dataset.incidentId, true));
+    marker.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectIncident(marker.dataset.incidentId, true);
+      }
+    });
+  });
+}
+
+function renderMetricsStrip() {
+  const point = stream.at(-1) ?? {};
+  const primary = ["active_connections", "waiting_connections", "xact_rate", "read_blocks_rate"];
+  metricsStrip.innerHTML = "";
+  primary.forEach((key) => {
+    const def = metricDefs.find((metric) => metric.key === key);
+    const alert = def.threshold != null && (point[key] ?? 0) >= def.threshold;
+    const card = document.createElement("div");
+    card.className = "metric-card" + (alert ? " alert" : "");
+    card.innerHTML = "<span>" + def.label + "</span><strong>" + formatValue(point[key]) + " " + def.unit + "</strong>";
+    metricsStrip.appendChild(card);
+  });
+}
+
+function renderIncidents() {
+  incidentSteps.innerHTML = "";
+  const sorted = incidents.slice().sort((left, right) => (right.last_seen_at ?? right.created_at) - (left.last_seen_at ?? left.created_at));
+  if (!sorted.length) {
+    const empty = document.createElement("li");
+    empty.className = "step empty";
+    empty.innerHTML = "<strong>No incidents yet</strong><span>Start pgbench load to create live signal movement.</span>";
+    incidentSteps.appendChild(empty);
+    return;
+  }
+  sorted.forEach((incident) => {
+    const li = document.createElement("li");
+    li.className = "step done status-" + incident.status + (selectedIncident()?.id === incident.id ? " selected" : "");
+    li.setAttribute("role", "button");
+    li.setAttribute("tabindex", "0");
+    li.innerHTML =
+      '<div class="step-head"><strong>' + incident.type + '</strong><span class="status-pill">' + incident.status + "</span></div>" +
+      "<span>" + formatClock(incident.last_seen_at ?? incident.created_at) + " - " + incident.metric + " = " + formatValue(incident.value) + " · conf " + formatValue((incident.confidence ?? 0) * 100) + "%</span>" +
+      '<div class="investigation-mini"><span>' + (incident.investigation?.phase ?? "queued") + '</span><div><i style="width:' + (incident.investigation?.progress ?? 0) + '%"></i></div></div>';
+    li.addEventListener("click", () => selectIncident(incident.id, true));
+    li.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectIncident(incident.id, true);
+      }
+    });
+    incidentSteps.appendChild(li);
+  });
+}
+
+function renderReport() {
+  const incident = selectedIncident();
+  if (!incident) return;
+  document.getElementById("reportTitle").textContent = incident.type;
+  const detector = incident.detector ?? { name: "Unknown detector", engine: "unknown", future_engine: "ml_ready" };
+  const evidenceRows = (incident.evidence ?? []).map((item) => (
+    "<tr><td>" + item.metric + "</td><td>" + formatValue(item.value) + "</td><td>" + (item.threshold ?? item.role ?? "") + "</td></tr>"
+  )).join("");
+  const hypotheses = (incident.hypotheses ?? []).map((item) => (
+    '<div class="hypothesis"><div class="hypothesis-head"><strong>' + item.cause + '</strong><span>' + formatValue((item.score ?? 0) * 100) + "%</span></div><p>" + item.why + "</p></div>"
+  )).join("");
+  const chain = (incident.causal_chain ?? []).map((item) => (
+    '<div class="chain-step done"><span>' + item.stage + '</span><strong>' + item.label + '</strong><small>' + item.detail + '</small></div>'
+  )).join("");
+  const investigation = incident.investigation ?? {};
+  const investigationSteps = (investigation.steps ?? []).map((item) => (
+    '<li class="investigation-step ' + item.status + '"><span class="status-pill">' + item.status + '</span><div><strong>' + item.label + '</strong><p>' + item.detail + '</p></div></li>'
+  )).join("");
+  const nextActions = (investigation.next_actions ?? []).map((item) => "<li>" + item + "</li>").join("");
+  document.getElementById("tab-diagnosis").innerHTML =
+    '<div class="report-block"><strong>Status</strong><p><span class="status-pill">' + incident.status + "</span> confidence " + formatValue((incident.confidence ?? 0) * 100) + "%</p></div>" +
+    '<div class="report-block"><strong>Investigation process</strong><div class="investigation-header"><div><span class="status-pill">' + (investigation.state ?? "queued") + '</span><strong>' + (investigation.phase ?? "queued") + '</strong><p>' + (investigation.summary ?? "Waiting for incident evidence.") + '</p></div><div class="progress-ring">' + formatValue(investigation.progress ?? 0) + '%</div></div><ol class="investigation-list">' + investigationSteps + '</ol></div>' +
+    '<div class="report-block"><strong>Inference engine</strong><p>' + (investigation.engine?.mode ?? "hybrid_inference") + " · current: " + (investigation.engine?.current ?? "rules") + " · future: " + (investigation.engine?.future ?? "ml_model_or_ai_agent") + '</p></div>' +
+    '<div class="report-block"><strong>Detector</strong><p>' + detector.name + " · engine: " + detector.engine + " · future: " + detector.future_engine + '</p></div>' +
+    '<div class="report-block"><strong>Detected metric</strong><p>' + incident.metric + " = " + formatValue(incident.value) + " threshold " + formatValue(incident.threshold) + '</p></div>' +
+    '<div class="report-block"><strong>Time window</strong><p>' + formatClock(incident.created_at) + " - " + formatClock(incident.last_seen_at) + " · samples " + incident.sample_count + '</p></div>' +
+    '<div class="report-block"><strong>Interpretation</strong><p>' + incident.summary + '</p></div>' +
+    '<div class="report-block"><strong>Causal chain draft</strong><div class="chain">' + chain + '</div></div>' +
+    '<div class="report-block"><strong>Competing hypotheses</strong><div class="hypothesis-list">' + hypotheses + '</div></div>' +
+    '<div class="report-block"><strong>Evidence</strong><table class="report-table"><thead><tr><th>Metric</th><th>Value</th><th>Comparator</th></tr></thead><tbody>' + evidenceRows + '</tbody></table></div>' +
+    '<div class="report-block"><strong>Next actions</strong><ul class="next-actions">' + nextActions + '</ul></div>';
+}
+
+async function loadIncident(id) {
+  const response = await fetch(API_BASE + "/api/incidents/" + encodeURIComponent(id));
+  if (!response.ok) return null;
+  const data = await response.json();
+  if (!data.incident) return null;
+  return upsertIncident(data.incident);
+}
+
+function selectIncident(id, open) {
+  selectedIncidentId = id;
+  render();
+  loadIncident(id).then((incident) => {
+    if (incident) render();
+  });
+  if (open) openDrawer();
+}
+
+function render() {
+  renderStatus();
+  renderChart();
+  renderMetricsStrip();
+  renderIncidents();
+  renderReport();
+}
+
+async function postJson(url, payload) {
+  const response = await fetch(API_BASE + url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload ?? {})
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({ message: response.statusText }));
+    throw new Error(data.message);
+  }
+  return response.json();
+}
+
+function openDrawer() {
+  renderReport();
+  backdrop.hidden = false;
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+}
+
+function closeDrawer() {
+  backdrop.hidden = true;
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true");
+}
+
+startLoad.addEventListener("click", async () => {
+  startLoad.disabled = true;
+  try {
+    await postJson("/api/load/start", {
+      clients: Number(loadClients.value),
+      jobs: 4,
+      seconds: Number(loadSeconds.value),
+      mode: loadMode.value
+    });
+  } catch (error) {
+    statusSubtitle.textContent = error.message;
+  }
+});
+
+stopLoad.addEventListener("click", async () => {
+  try {
+    await postJson("/api/load/stop", {});
+  } catch (error) {
+    statusSubtitle.textContent = error.message;
+  }
+});
+
+statusActions.forEach((button) => {
+  button.addEventListener("click", async () => {
+    const incident = selectedIncident();
+    if (!incident) return;
+    const data = await postJson("/api/incidents/status", {
+      id: incident.id,
+      status: button.dataset.status
+    });
+    if (data.incident) {
+      upsertIncident(data.incident);
+      render();
+    }
+  });
+});
+
+refreshIncident.addEventListener("click", async () => {
+  const incident = selectedIncident();
+  if (!incident) return;
+  const updated = await loadIncident(incident.id);
+  if (updated) render();
+});
+
+metricPicker.addEventListener("change", () => {
+  selectedMetric = metricDefs.find((metric) => metric.key === metricPicker.value);
+  renderChart();
+});
+openReport.addEventListener("click", openDrawer);
+closeReport.addEventListener("click", closeDrawer);
+backdrop.addEventListener("click", closeDrawer);
+
+renderMetricPicker();
+render();
+
+fetch(API_BASE + "/api/snapshot")
+  .then((response) => response.json())
+  .then(ingestSnapshot)
+  .catch(() => {
+    statusLabel.textContent = "Backend unavailable";
+    statusSubtitle.textContent = "Start it with python tools/cockpit_backend.py.";
+  });
+
+const events = new EventSource(API_BASE + "/events");
+events.onmessage = (message) => ingestEvent(JSON.parse(message.data));
+events.onerror = () => {
+  statusBand.classList.remove("state-ok", "state-warn", "state-bad");
+  statusBand.classList.add("state-bad");
+  statusLabel.textContent = "SSE disconnected";
+  statusSubtitle.textContent = "Waiting for backend connection to recover.";
+};

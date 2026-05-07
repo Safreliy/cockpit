@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Causal Cockpit</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="title">
+        <span class="eyebrow">Causal Cockpit</span>
+        <h1>Operations health</h1>
+      </div>
+      <div class="stream-control" aria-label="stream controls">
+        <button id="playPause" type="button">Pause</button>
+        <button id="resetStream" type="button">Reset</button>
+        <label>
+          Speed
+          <select id="speed">
+            <option value="900">1x</option>
+            <option value="450">2x</option>
+            <option value="180">5x</option>
+            <option value="90" selected>10x</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <section class="status-band" id="statusBand">
+      <div class="status-main">
+        <span class="status-dot" id="statusDot"></span>
+        <div>
+          <div class="status-label" id="statusLabel">Live stream active</div>
+          <div class="status-subtitle" id="statusSubtitle">Waiting for anomalous evidence.</div>
+        </div>
+      </div>
+      <div class="status-meta">
+        <div><span>Time</span><strong id="clock">00:00</strong></div>
+        <div><span>Flow</span><strong id="flowName">payments</strong></div>
+        <div><span>Confidence</span><strong id="confidence">--</strong></div>
+      </div>
+      <button class="report-button" id="openReport" type="button" disabled>Open report</button>
+    </section>
+
+    <section class="causal-strip" aria-label="causal chain">
+      <div class="panel-heading compact">
+        <h2>Investigation path</h2>
+        <p>The chain appears after an impact anomaly is detected or selected on the chart.</p>
+      </div>
+      <div class="chain" id="causalChain"></div>
+    </section>
+
+    <section class="workspace">
+      <div class="live-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Live telemetry</h2>
+            <p id="chartCaption">Primary business signal with synchronized stream cursor.</p>
+          </div>
+          <select id="metricPicker" aria-label="metric"></select>
+        </div>
+        <div class="chart-frame">
+          <svg id="liveChart" viewBox="0 0 860 320" role="img" aria-label="live telemetry chart"></svg>
+        </div>
+      </div>
+
+      <aside class="detection-panel">
+        <div class="panel-heading compact">
+          <div>
+            <h2>Detections</h2>
+            <p>Only incidents detected by the current stream time are listed here.</p>
+          </div>
+        </div>
+        <ol class="steps" id="detectionSteps"></ol>
+      </aside>
+    </section>
+
+    <section class="metrics-strip" id="metricsStrip" aria-label="current metric values"></section>
+  </main>
+
+  <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+  <aside class="drawer" id="reportDrawer" aria-hidden="true">
+    <div class="drawer-header">
+      <div>
+        <span class="eyebrow">Causal episode</span>
+        <h2 id="reportTitle">Diagnosis report</h2>
+      </div>
+      <button id="closeReport" type="button">Close</button>
+    </div>
+    <nav class="tabs" aria-label="report sections">
+      <button class="tab active" data-tab="diagnosis" type="button">Diagnosis</button>
+      <button class="tab" data-tab="hypotheses" type="button">Hypotheses</button>
+      <button class="tab" data-tab="evidence" type="button">Evidence</button>
+      <button class="tab" data-tab="rejected" type="button">Rejected</button>
+    </nav>
+    <section class="tab-panel active" id="tab-diagnosis"></section>
+    <section class="tab-panel" id="tab-hypotheses"></section>
+    <section class="tab-panel" id="tab-evidence"></section>
+    <section class="tab-panel" id="tab-rejected"></section>
+  </aside>
+
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

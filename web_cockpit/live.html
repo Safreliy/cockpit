@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Postgres Cockpit</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="title">
+        <span class="eyebrow">Live Cockpit</span>
+        <h1>Incident cockpit</h1>
+      </div>
+      <div class="stream-control" aria-label="load controls">
+        <label>Clients <input id="loadClients" class="small-input" type="number" min="1" max="128" value="32"></label>
+        <label>Seconds <input id="loadSeconds" class="small-input" type="number" min="5" max="900" value="60"></label>
+        <label>
+          Mode
+          <select id="loadMode">
+            <option value="mixed">mixed</option>
+            <option value="readonly">readonly</option>
+          </select>
+        </label>
+        <button id="startLoad" type="button">Start load</button>
+        <button id="stopLoad" type="button">Stop</button>
+      </div>
+    </header>
+
+    <section class="status-band" id="statusBand">
+      <div class="status-main">
+        <span class="status-dot"></span>
+        <div>
+          <div class="status-label" id="statusLabel">Connecting to backend</div>
+          <div class="status-subtitle" id="statusSubtitle">Waiting for SSE telemetry.</div>
+        </div>
+      </div>
+      <div class="status-meta">
+        <div><span>Samples</span><strong id="sampleCount">0</strong></div>
+        <div><span>Load</span><strong id="loadState">idle</strong></div>
+        <div><span>Retention</span><strong id="retentionState">memory</strong></div>
+      </div>
+      <button class="report-button" id="openReport" type="button" disabled>Open incident</button>
+    </section>
+
+    <section class="workspace">
+      <div class="live-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Streaming metrics</h2>
+            <p>Telemetry is supporting evidence for incident investigation.</p>
+          </div>
+          <select id="metricPicker" aria-label="metric"></select>
+        </div>
+        <div class="chart-frame">
+          <svg id="liveChart" viewBox="0 0 860 320" role="img" aria-label="live postgres telemetry chart"></svg>
+        </div>
+      </div>
+
+      <aside class="detection-panel">
+        <div class="panel-heading compact">
+          <div>
+            <h2>Incidents</h2>
+            <p>Open and recent incidents built from live detector output.</p>
+          </div>
+        </div>
+        <ol class="steps" id="incidentSteps"></ol>
+      </aside>
+    </section>
+
+    <section class="metrics-strip" id="metricsStrip" aria-label="current metric values"></section>
+  </main>
+
+  <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+  <aside class="drawer" id="reportDrawer" aria-hidden="true">
+    <div class="drawer-header">
+      <div>
+        <span class="eyebrow">Live incident</span>
+        <h2 id="reportTitle">Incident details</h2>
+      </div>
+      <button id="closeReport" type="button">Close</button>
+    </div>
+    <div class="incident-actions" aria-label="incident actions">
+      <button id="refreshIncident" type="button">Refresh investigation</button>
+      <button class="status-action" data-status="acknowledged" type="button">Acknowledge</button>
+      <button class="status-action" data-status="resolved" type="button">Resolve</button>
+      <button class="status-action" data-status="false_positive" type="button">False positive</button>
+    </div>
+    <section class="tab-panel active" id="tab-diagnosis"></section>
+  </aside>
+
+  <script src="live_app.js"></script>
+</body>
+</html>

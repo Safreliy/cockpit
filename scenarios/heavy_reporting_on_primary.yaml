@@ -1,0 +1,40 @@
+{
+  "id": "heavy_reporting_on_primary",
+  "title": "Heavy reporting workload on primary database",
+  "location": "postgres-primary-1",
+  "mechanism": "storage_read_contention",
+  "business_flow": "payments",
+  "impact_metric": "payments_p95_ms",
+  "slo_ms": 500,
+  "rejected_causes": ["cpu_saturation", "network_packet_loss", "replication_lag"],
+  "recommended_action": "Move reporting workload to a read replica or throttle it until payments p95 returns below SLO.",
+  "graph_nodes": [
+    {"id": "cause", "kind": "cause", "label": "heavy_reporting_on_primary", "metric": "reporting_concurrency"},
+    {"id": "mechanism", "kind": "mechanism", "label": "storage_read_contention"},
+    {"id": "storage", "kind": "state", "label": "storage_read_latency_p95_ms up", "metric": "storage_read_latency_p95_ms"},
+    {"id": "query_wait", "kind": "symptom", "label": "short_query_wait_p95_ms up", "metric": "short_query_wait_p95_ms"},
+    {"id": "payments", "kind": "impact", "label": "payments_p95_ms exceeds SLO", "metric": "payments_p95_ms"},
+    {"id": "business", "kind": "business_status", "label": "payments degraded"}
+  ],
+  "graph_edges": [
+    {"source": "cause", "target": "mechanism", "delay_seconds": 60, "strength": 1.0},
+    {"source": "mechanism", "target": "storage", "delay_seconds": 60, "strength": 1.0},
+    {"source": "storage", "target": "query_wait", "delay_seconds": 60, "strength": 1.0},
+    {"source": "query_wait", "target": "payments", "delay_seconds": 60, "strength": 1.0},
+    {"source": "payments", "target": "business", "delay_seconds": 30, "strength": 1.0}
+  ],
+  "metrics": {
+    "reporting_concurrency": 4,
+    "storage_read_latency_p95_ms": 18,
+    "short_query_wait_p95_ms": 12,
+    "payments_p95_ms": 180,
+    "cpu_utilization_pct": 42,
+    "network_loss_pct": 0.01,
+    "replication_lag_sec": 1.2
+  },
+  "ground_truth": {
+    "root_cause": "heavy_reporting_on_primary",
+    "mechanism": "storage_read_contention",
+    "business_flow": "payments"
+  }
+}
