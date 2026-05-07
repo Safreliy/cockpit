@@ -11,7 +11,7 @@ The project started as a causal load simulator and now includes a local live sta
 - Detects suspicious activity through a pluggable detector pipeline: rule-based, statistical, and ML detectors.
 - Aggregates detector signals into incident periods by fingerprint.
 - Shows incident lifecycle: candidate, active, recovering, resolved, acknowledged, false positive.
-- Displays an investigation process that can later be driven by ML/AI inference.
+- Displays an investigation process and can delegate root-cause analysis to a separate AI agent backend.
 - Provides a sandbox-only DBA experiment lab for controlled PostgreSQL setting changes and rollback.
 - Keeps telemetry bounded: backend uses rolling memory buffers, Prometheus has TSDB retention.
 
@@ -34,6 +34,24 @@ Initialize pgbench data if needed:
 ```
 
 Then open `Benchmark lab`, start a workload, and watch incidents, investigation state, and metric movement.
+
+## AI Agent Integration
+
+Cockpit can call a separately running `whatareyatalkinabout` backend for AI root-cause verdicts. Configure it with environment variables; do not commit real API keys.
+
+```powershell
+$env:AI_AGENT_BASE_URL="http://host.docker.internal:8000"
+$env:LLM_MODEL="your-model-name"
+$env:LLM_BASE_URL="https://your-openai-compatible-endpoint/v1"
+$env:LLM_API_KEY="..."
+docker compose -f infra/docker-compose.yml up -d --build cockpit_backend
+```
+
+Optional:
+
+- `AI_AGENT_MODEL_ID` - reuse an existing model in the agent backend.
+- `AI_AGENT_MCP_URL` or `AI_AGENT_MCP_IDS` - attach MCP tools to the per-incident agent session.
+- `AI_AGENT_USER_ID` - stable user id used by cockpit when creating agent chats.
 
 ## Simulator MVP
 

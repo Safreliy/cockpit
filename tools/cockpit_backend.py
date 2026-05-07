@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from cockpit.ai_agent import AIAgentError, ai_agent_enabled, run_ai_investigation
 from cockpit.detectors import build_investigation, detector_catalog, evaluate_detectors
 from cockpit.experiments import EXPERIMENT_SETTINGS
 from live_pg_monitor import QUERIES, query_prometheus, query_settings
@@ -420,6 +421,73 @@ class TelemetryStore:
             self._publish_locked({"type": "incident", "incident": incident})
             return True, "updated", incident
 
+    def start_ai_investigation(self, incident_id: str) -> tuple[bool, str, dict[str, Any] | None]:
+        with self.lock:
+            incident = next((item for item in self.incidents if item["id"] == incident_id), None)
+            if incident is None:
+                return False, "incident not found", None
+            if incident.get("ai_investigation", {}).get("status") == "running":
+                return False, "AI investigation is already running", incident
+            incident["ai_investigation"] = {
+                **incident.get("ai_investigation", {}),
+                "status": "running",
+                "started_at": int(time.time()),
+                "updated_at": int(time.time()),
+            }
+            if incident.get("investigation"):
+                incident["investigation"]["state"] = "ai_inference"
+                incident["investigation"]["phase"] = "ai_root_cause_analysis"
+                incident["investigation"]["progress"] = max(int(incident["investigation"].get("progress", 0)), 70)
+                incident["investigation"]["updated_at"] = incident["ai_investigation"]["updated_at"]
+            stream = list(self.points)
+            settings = dict(self.settings)
+            incident_copy = dict(incident)
+            self._publish_locked({"type": "incident", "incident": incident})
+
+        threading.Thread(
+            target=self._run_ai_investigation_thread,
+            args=(incident_id, incident_copy, stream, settings),
+            daemon=True,
+        ).start()
+        return True, "started", incident
+
+    def _run_ai_investigation_thread(
+        self,
+        incident_id: str,
+        incident: dict[str, Any],
+        stream: list[dict[str, float]],
+        settings: dict[str, Any],
+    ) -> None:
+        try:
+            result = run_ai_investigation(
+                incident,
+                stream,
+                settings,
+                existing_session=incident.get("ai_investigation"),
+            )
+        except AIAgentError as error:
+            result = {"status": "failed", "updated_at": int(time.time()), "error": str(error)}
+        except Exception as error:
+            result = {"status": "failed", "updated_at": int(time.time()), "error": f"unexpected AI investigation error: {error}"}
+        with self.lock:
+            current = next((item for item in self.incidents if item["id"] == incident_id), None)
+            if current is None:
+                return
+            current["ai_investigation"] = {**current.get("ai_investigation", {}), **result}
+            if result.get("status") == "complete":
+                current["ai_verdict"] = result.get("verdict")
+                if current.get("investigation"):
+                    current["investigation"]["state"] = "ai_complete"
+                    current["investigation"]["phase"] = "ai_verdict_ready"
+                    current["investigation"]["progress"] = 100
+                    current["investigation"]["summary"] = str(result.get("verdict", {}).get("verdict", "AI verdict is ready."))
+                    current["investigation"]["updated_at"] = int(time.time())
+            elif current.get("investigation"):
+                current["investigation"]["state"] = "ai_failed"
+                current["investigation"]["phase"] = "ai_unavailable"
+                current["investigation"]["updated_at"] = int(time.time())
+            self._publish_locked({"type": "incident", "incident": current})
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
@@ -434,6 +502,12 @@ class TelemetryStore:
                 "experiments": list(self.experiments),
                 "experiment_settings": EXPERIMENT_SETTINGS,
                 "detectors": detector_catalog(self.enabled_detector_ids),
+                "ai_agent": {
+                    "enabled": ai_agent_enabled(),
+                    "base_url": os.environ.get("AI_AGENT_BASE_URL", ""),
+                    "model": os.environ.get("LLM_MODEL") or os.environ.get("AI_AGENT_MODEL_NAME", ""),
+                    "mcp_url": os.environ.get("AI_AGENT_MCP_URL", ""),
+                },
                 "load": self.load_status_locked(),
                 "retention": {
                     "telemetry_points": self.points.maxlen,
@@ -709,6 +783,12 @@ class Handler(SimpleHTTPRequestHandler):
                 str(payload.get("note", "")),
             )
             self.write_json({"ok": ok, "message": message, "incident": incident}, status=200 if ok else 400)
+            return
+        if parsed.path == "/api/incidents/ai":
+            payload = self.read_json()
+            ok, message, incident = self.store.start_ai_investigation(str(payload.get("id", "")))
+            status = 200 if ok else 404 if message == "incident not found" else 409
+            self.write_json({"ok": ok, "message": message, "incident": incident}, status=status)
             return
         if parsed.path == "/api/detectors":
             payload = self.read_json()

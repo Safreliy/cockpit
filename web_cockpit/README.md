@@ -23,6 +23,7 @@ The live UI consumes:
 
 - `/api/snapshot`
 - `/api/incidents/:id`
+- `/api/incidents/ai`
 - `/api/load/start`
 - `/api/load/stop`
 - `/api/detectors`
@@ -31,6 +32,8 @@ The live UI consumes:
 - `/events` over Server-Sent Events
 
 `Benchmark lab` currently runs pgbench workloads with configurable clients, jobs, duration, mode, target TPS, and profiles for default TPS, read-only, planner range scans, sort pressure, aggregate scans, and write-path pressure. The UI keeps the workload engine explicit so additional generators can be added behind the same controls.
+
+AI verdicts are produced by a separately running `whatareyatalkinabout` backend. Set `AI_AGENT_BASE_URL` and either `AI_AGENT_MODEL_ID` or `LLM_MODEL`/`LLM_BASE_URL`/`LLM_API_KEY` before starting `cockpit_backend`.
 
 ## Replay UI
 

@@ -21,6 +21,7 @@ let operationalEvents = [];
 let experiments = [];
 let experimentSettings = {};
 let detectorCatalog = [];
+let aiAgent = { enabled: false };
 let selectedDetectorId = "all";
 let selectedMetric = metricDefs.find((metric) => metric.key === "xact_rate");
 let selectedIncidentId = null;
@@ -78,6 +79,7 @@ const applyExperiment = document.getElementById("applyExperiment");
 const experimentList = document.getElementById("experimentList");
 const statusActions = document.querySelectorAll(".status-action");
 const refreshIncident = document.getElementById("refreshIncident");
+const runAiInvestigation = document.getElementById("runAiInvestigation");
 
 function formatValue(value) {
   if (value == null) return "--";
@@ -177,6 +179,7 @@ function ingestSnapshot(snapshot) {
   experiments = snapshot.experiments ?? [];
   experimentSettings = snapshot.experiment_settings ?? {};
   detectorCatalog = snapshot.detectors ?? [];
+  aiAgent = snapshot.ai_agent ?? { enabled: false };
   selectedDetectorId = selectedDetectorFromCatalog();
   renderDetectorPicker();
   renderExperimentSettings();
@@ -545,6 +548,9 @@ function incidentReportVersion(incident) {
     incident.updated_at,
     incident.investigation?.phase,
     incident.investigation?.progress,
+    incident.ai_investigation?.status,
+    incident.ai_investigation?.updated_at,
+    incident.ai_verdict?.verdict,
     showAllOps ? "all-ops" : "latest-ops"
   ].join("|");
 }
@@ -588,11 +594,24 @@ function renderReport(options = {}) {
   const timeline = (incident.timeline ?? []).slice(-12).reverse().map((item) => (
     '<li><strong>' + item.type + '</strong><span>' + formatClock(item.t) + ' - ' + item.metric + ' = ' + formatValue(item.value) + ' · score ' + formatValue(item.score) + '</span></li>'
   )).join("");
+  const ai = incident.ai_investigation ?? {};
+  const aiVerdict = incident.ai_verdict ?? ai.verdict;
+  const aiChain = (aiVerdict?.causal_chain ?? []).map((item) => (
+    '<div class="chain-step done"><span>' + (item.stage ?? "evidence") + '</span><strong>' + (item.detail ?? "") + '</strong></div>'
+  )).join("");
+  const aiEvidence = (aiVerdict?.supporting_evidence ?? []).map((item) => "<li>" + item + "</li>").join("");
+  const aiActions = (aiVerdict?.recommended_actions ?? []).map((item) => "<li>" + item + "</li>").join("");
+  const aiBlock = aiVerdict
+    ? '<div class="report-block ai-verdict"><strong>AI verdict</strong><p><span class="status-pill">' + (ai.status ?? "complete") + '</span> confidence ' + formatValue((aiVerdict.confidence ?? 0) * 100) + '%</p><h2>' + (aiVerdict.verdict ?? "Verdict ready") + '</h2><p>' + (aiVerdict.root_cause ?? "") + '</p><div class="chain">' + aiChain + '</div><strong>Supporting evidence</strong><ul class="next-actions">' + (aiEvidence || "<li>No supporting evidence returned.</li>") + '</ul><strong>Recommended actions</strong><ul class="next-actions">' + (aiActions || "<li>No recommended actions returned.</li>") + '</ul></div>'
+    : '<div class="report-block"><strong>AI verdict</strong><p>' + (ai.status === "running" ? "AI investigation is running." : ai.status === "failed" ? "AI investigation failed: " + (ai.error ?? "unknown error") : "AI investigation has not been started for this incident.") + '</p></div>';
+  runAiInvestigation.disabled = ai.status === "running" || !aiAgent.enabled;
+  runAiInvestigation.title = aiAgent.enabled ? "Run AI root-cause investigation" : "AI agent backend is not configured";
   document.getElementById("tab-diagnosis").innerHTML =
     '<div class="report-block"><strong>Status</strong><p><span class="status-pill">' + incident.status + "</span> confidence " + formatValue((incident.confidence ?? 0) * 100) + "%</p></div>" +
     '<div class="report-block"><strong>Incident period</strong><p>' + formatClock(incident.started_at ?? incident.created_at) + " - " + formatClock(incident.resolved_at ?? incident.last_seen_at) + " · signals " + (incident.signal_count ?? 1) + " · fingerprint " + (incident.fingerprint ?? incident.type) + '</p></div>' +
     '<div class="report-block"><strong>Investigation process</strong><div class="investigation-header"><div><span class="status-pill">' + (investigation.state ?? "queued") + '</span><strong>' + (investigation.phase ?? "queued") + '</strong><p>' + (investigation.summary ?? "Waiting for incident evidence.") + '</p></div><div class="progress-ring" style="--progress:' + Math.max(0, Math.min(100, investigation.progress ?? 0)) + '%"><span>' + formatValue(investigation.progress ?? 0) + '%</span></div></div><ol class="investigation-list">' + investigationSteps + '</ol></div>' +
     '<div class="report-block"><strong>Inference engine</strong><p>' + (investigation.engine?.mode ?? "hybrid inference") + " · " + (investigation.engine?.current ?? "active detector pipeline") + '</p></div>' +
+    aiBlock +
     '<div class="report-block"><strong>Detector</strong><p>' + detector.name + " · engine: " + detector.engine + '</p></div>' +
     '<div class="report-block"><strong>Detected metric</strong><p>' + incident.metric + " = " + formatValue(incident.value) + " threshold " + formatValue(incident.threshold) + '</p></div>' +
     '<div class="report-block"><strong>Time window</strong><p>' + formatClock(incident.created_at) + " - " + formatClock(incident.last_seen_at) + " · samples " + incident.sample_count + '</p></div>' +
@@ -912,6 +931,29 @@ refreshIncident.addEventListener("click", async () => {
     renderStatus();
     renderIncidents();
     renderReport({ force: true });
+  }
+});
+
+runAiInvestigation.addEventListener("click", async () => {
+  const incident = selectedIncident();
+  if (!incident) return;
+  if (!aiAgent.enabled) {
+    statusSubtitle.textContent = "AI agent backend is not configured.";
+    return;
+  }
+  runAiInvestigation.disabled = true;
+  try {
+    const data = await postJson("/api/incidents/ai", { id: incident.id });
+    if (data.incident) {
+      upsertIncident(data.incident);
+      renderStatus();
+      renderIncidents();
+      renderReport({ force: true });
+    }
+  } catch (error) {
+    statusSubtitle.textContent = error.message;
+  } finally {
+    runAiInvestigation.disabled = false;
   }
 });
 

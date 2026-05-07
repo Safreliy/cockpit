@@ -841,6 +841,15 @@ svg {
   overflow-wrap: anywhere;
 }
 
+.ai-verdict {
+  border-color: rgba(35, 100, 170, 0.35);
+  background: #f4f9ff;
+}
+
+.ai-verdict h2 {
+  margin: 8px 0 6px;
+}
+
 .report-block-head {
   display: flex;
   align-items: center;
