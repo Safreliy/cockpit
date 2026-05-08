@@ -15,8 +15,6 @@ web_cockpit/live_data.js
 .env.*
 !.env.example
 
-whatareyatalkinabout/
-
 *.log
 *.tmp
 Thumbs.db

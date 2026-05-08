@@ -54,8 +54,6 @@ def test_ml_detector_uses_signal_contract():
         "score",
         "detector",
         "evidence",
-        "hypotheses",
-        "causal_chain",
     ]:
         assert key in signal
     assert signal["detector"]["engine"] == "ml"

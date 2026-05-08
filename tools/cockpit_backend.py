@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from cockpit.ai_agent import AIAgentError, ai_agent_enabled, run_ai_investigation
+from cockpit.ai_agent import AIAgentError, WhatareyatalkinaboutClient, ai_agent_enabled, run_ai_investigation
 from cockpit.detectors import build_investigation, detector_catalog, evaluate_detectors
 from cockpit.experiments import EXPERIMENT_SETTINGS
+from cockpit.persistence import NoopPersistence, Persistence, PostgresPersistence
 from live_pg_monitor import QUERIES, query_prometheus, query_settings
 
 
@@ -41,7 +42,12 @@ SELECT bid, sum(abalance), avg(abalance) FROM pgbench_accounts GROUP BY bid ORDE
 
 
 class TelemetryStore:
-    def __init__(self, max_points: int = 720, max_detections: int = 200) -> None:
+    def __init__(
+        self,
+        max_points: int = 720,
+        max_detections: int = 200,
+        persistence: Persistence | None = None,
+    ) -> None:
         self.points: deque[dict[str, float]] = deque(maxlen=max_points)
         self.detections: deque[dict[str, Any]] = deque(maxlen=max_detections)
         self.signals: deque[dict[str, Any]] = deque(maxlen=max_detections)
@@ -61,9 +67,12 @@ class TelemetryStore:
         self.load_output: deque[str] = deque(maxlen=40)
         self.load_script_path: str | None = None
         self.enabled_detector_ids: set[str] | None = None
+        self.persistence = persistence or NoopPersistence()
 
     def add_point(self, point: dict[str, float]) -> None:
         events: list[dict[str, Any]] = [{"type": "telemetry", "point": point}]
+        persist_signals: list[dict[str, Any]] = []
+        persist_incidents: list[dict[str, Any]] = []
         with self.lock:
             history = list(self.points)
             signals = evaluate_detectors(point, history, self.enabled_detector_ids)
@@ -72,8 +81,10 @@ class TelemetryStore:
             for signal in signals:
                 self.signals.append(signal)
                 self.detections.append(signal)
+                persist_signals.append(dict(signal))
                 incident = self.upsert_incident_locked(signal)
                 if incident:
+                    persist_incidents.append(dict(incident))
                     events.append({"type": "detection", "detection": signal})
                     events.append({"type": "signal", "signal": signal})
                     events.append({"type": "incident", "incident": incident})
@@ -83,9 +94,62 @@ class TelemetryStore:
                 if incident["fingerprint"] not in seen_fingerprints:
                     updated = self.advance_incident_without_signal_locked(incident, int(point["t"]))
                     if updated:
+                        persist_incidents.append(dict(incident))
                         events.append({"type": "incident", "incident": incident})
             for event in events:
                 self._publish_locked(event)
+        self.persist_many(persist_signals, persist_incidents)
+
+    def hydrate_from_persistence(self, limit: int) -> None:
+        try:
+            data = self.persistence.load_recent(limit)
+        except Exception as error:
+            print(f"persistence load failed: {error}", flush=True)
+            return
+        with self.lock:
+            for signal in data.get("signals", []):
+                self.signals.append(signal)
+                self.detections.append(signal)
+            self.incidents.clear()
+            self.active_by_type.clear()
+            self.active_by_fingerprint.clear()
+            now = int(time.time())
+            for incident in data.get("incidents", []):
+                self.incidents.append(incident)
+                if incident.get("status") not in {"resolved", "false_positive"}:
+                    self.active_by_type[str(incident.get("type"))] = str(incident.get("id"))
+                    self.active_by_fingerprint[str(incident.get("fingerprint"))] = str(incident.get("id"))
+                if incident.get("status") in {"resolved", "false_positive"}:
+                    self.cooldown_until[str(incident.get("fingerprint"))] = now
+
+    def persist_many(self, signals: list[dict[str, Any]], incidents: list[dict[str, Any]]) -> None:
+        for signal in signals:
+            try:
+                self.persistence.save_signal(signal)
+            except Exception as error:
+                print(f"signal persistence failed: {error}", flush=True)
+        seen_incidents: set[str] = set()
+        for incident in incidents:
+            incident_id = str(incident.get("id", ""))
+            if incident_id in seen_incidents:
+                continue
+            seen_incidents.add(incident_id)
+            try:
+                self.persistence.save_incident(incident)
+            except Exception as error:
+                print(f"incident persistence failed: {error}", flush=True)
+
+    def persist_incident(self, incident: dict[str, Any]) -> None:
+        try:
+            self.persistence.save_incident(dict(incident))
+        except Exception as error:
+            print(f"incident persistence failed: {error}", flush=True)
+
+    def collect_query_fingerprint_snapshot(self, observed_at: int) -> None:
+        try:
+            self.persistence.collect_query_fingerprint_snapshot(observed_at)
+        except Exception as error:
+            print(f"query fingerprint snapshot failed: {error}", flush=True)
 
     def advance_incident_without_signal_locked(self, incident: dict[str, Any], now: int) -> bool:
         incident["quiet_samples"] = int(incident.get("quiet_samples", 0)) + 1
@@ -197,6 +261,32 @@ class TelemetryStore:
         process = subprocess.run(args, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
         return process.returncode == 0, process.stdout.strip()
 
+    def run_psql_scalar(self, sql: str) -> tuple[bool, str]:
+        psql = shutil.which("psql")
+        if not psql:
+            return False, "psql is not available in backend runtime"
+        env = os.environ.copy()
+        if os.environ.get("PGPASSWORD"):
+            env["PGPASSWORD"] = os.environ["PGPASSWORD"]
+        args = [
+            psql,
+            "-h",
+            os.environ.get("PGHOST", "127.0.0.1"),
+            "-p",
+            os.environ.get("PGPORT", "55432"),
+            "-U",
+            os.environ.get("PGUSER", "cockpit"),
+            "-d",
+            os.environ.get("PGDATABASE", "cockpit"),
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-qAt",
+            "-c",
+            sql,
+        ]
+        process = subprocess.run(args, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+        return process.returncode == 0, process.stdout.strip()
+
     def run_psql_many(self, statements: list[str]) -> tuple[bool, str]:
         output: list[str] = []
         for statement in statements:
@@ -212,6 +302,8 @@ class TelemetryStore:
             return False, "setting is not allowed for cockpit experiments", None
         if not self.is_safe_setting_value(value):
             return False, "setting value contains unsupported characters", None
+        if EXPERIMENT_SETTINGS[name].get("kind") == "table_storage":
+            return self.apply_table_storage_experiment(name, value)
         with self.lock:
             previous = dict(self.settings.get(name, {"setting": EXPERIMENT_SETTINGS[name]["default"], "unit": ""}))
         ok, output = self.run_psql_many([f"ALTER SYSTEM SET {name} = '{value}'", "SELECT pg_reload_conf()"])
@@ -244,6 +336,53 @@ class TelemetryStore:
             self._publish_locked({"type": "experiment", "experiment": experiment})
         return True, "applied", experiment
 
+    def apply_table_storage_experiment(self, name: str, value: str) -> tuple[bool, str, dict[str, Any] | None]:
+        meta = EXPERIMENT_SETTINGS[name]
+        table = str(meta["table"])
+        parameter = str(meta["storage_parameter"])
+        if parameter != "fillfactor" or table not in {"pgbench_accounts", "pgbench_branches", "pgbench_tellers"}:
+            return False, "table storage experiment is not allowed", None
+        try:
+            numeric_value = int(value)
+        except ValueError:
+            return False, "fillfactor must be an integer", None
+        if not 10 <= numeric_value <= 100:
+            return False, "fillfactor must be between 10 and 100", None
+        ok, previous_value = self.run_psql_scalar(
+            f"SELECT coalesce((SELECT split_part(option, '=', 2) FROM unnest(coalesce(reloptions, ARRAY[]::text[])) AS option WHERE option LIKE '{parameter}=%'), '100') FROM pg_class WHERE oid = 'public.{table}'::regclass"
+        )
+        if not ok:
+            return False, previous_value or "failed to read current table storage option", None
+        ok, output = self.run_psql(f"ALTER TABLE public.{table} SET ({parameter} = {numeric_value})")
+        if not ok:
+            return False, output or "failed to apply table storage option", None
+        experiment = {
+            "id": f"exp-{name}-{int(time.time())}",
+            "t": int(time.time()),
+            "type": "postgres_table_storage_experiment",
+            "status": "applied",
+            "setting": name,
+            "value": value,
+            "previous": {"setting": previous_value or meta["default"], "unit": "", "kind": "table_storage"},
+            "summary": f"Applied storage experiment: {table}.{parameter} = {value}.",
+        }
+        event = {
+            "id": f"op-experiment-{name}-{experiment['t']}",
+            "t": experiment["t"],
+            "type": "postgres_table_storage_experiment",
+            "severity": "warning",
+            "summary": experiment["summary"],
+            "setting": name,
+            "previous": experiment["previous"],
+            "current": {"setting": value, "kind": "table_storage"},
+        }
+        with self.lock:
+            self.experiments.append(experiment)
+            self.operational_events.append(event)
+            self._publish_locked({"type": "operational_event", "event": event})
+            self._publish_locked({"type": "experiment", "experiment": experiment})
+        return True, "applied", experiment
+
     def rollback_setting_experiment(self, experiment_id: str) -> tuple[bool, str, dict[str, Any] | None]:
         with self.lock:
             experiment = next((item for item in self.experiments if item["id"] == experiment_id), None)
@@ -252,6 +391,8 @@ class TelemetryStore:
         if experiment.get("status") == "rolled_back":
             return False, "experiment is already rolled back", experiment
         name = str(experiment["setting"])
+        if EXPERIMENT_SETTINGS[name].get("kind") == "table_storage":
+            return self.rollback_table_storage_experiment(experiment)
         previous_value = str(experiment.get("previous", {}).get("setting", EXPERIMENT_SETTINGS[name]["default"]))
         if not self.is_safe_setting_value(previous_value):
             return False, "previous setting value is unsupported", None
@@ -269,6 +410,38 @@ class TelemetryStore:
                 "summary": f"Rolled back experiment: {name} = {previous_value}.",
                 "setting": name,
                 "current": {"setting": previous_value},
+            }
+            self.operational_events.append(event)
+            self._publish_locked({"type": "operational_event", "event": event})
+            self._publish_locked({"type": "experiment", "experiment": experiment})
+            return True, "rolled back", experiment
+
+    def rollback_table_storage_experiment(self, experiment: dict[str, Any]) -> tuple[bool, str, dict[str, Any] | None]:
+        name = str(experiment["setting"])
+        meta = EXPERIMENT_SETTINGS[name]
+        table = str(meta["table"])
+        parameter = str(meta["storage_parameter"])
+        previous_value = str(experiment.get("previous", {}).get("setting", meta["default"]))
+        try:
+            numeric_value = int(previous_value)
+        except ValueError:
+            return False, "previous fillfactor is unsupported", None
+        if not 10 <= numeric_value <= 100:
+            return False, "previous fillfactor is outside the supported range", None
+        ok, output = self.run_psql(f"ALTER TABLE public.{table} SET ({parameter} = {numeric_value})")
+        if not ok:
+            return False, output or "failed to roll back table storage option", None
+        with self.lock:
+            experiment["status"] = "rolled_back"
+            experiment["rolled_back_at"] = int(time.time())
+            event = {
+                "id": f"op-experiment-rollback-{name}-{experiment['rolled_back_at']}",
+                "t": experiment["rolled_back_at"],
+                "type": "postgres_table_storage_rollback",
+                "severity": "info",
+                "summary": f"Rolled back storage experiment: {table}.{parameter} = {previous_value}.",
+                "setting": name,
+                "current": {"setting": previous_value, "kind": "table_storage"},
             }
             self.operational_events.append(event)
             self._publish_locked({"type": "operational_event", "event": event})
@@ -318,8 +491,6 @@ class TelemetryStore:
                 "detector": detection["detector"],
                 "evidence": detection["evidence"],
                 "operational_events": related_events,
-                "hypotheses": detection["hypotheses"],
-                "causal_chain": detection["causal_chain"],
                 "investigation": investigation,
                 "timeline": [self.signal_timeline_entry(detection)],
                 "notes": [],
@@ -359,8 +530,6 @@ class TelemetryStore:
                 "detector": detection["detector"],
                 "evidence": detection["evidence"],
                 "operational_events": related_events,
-                "hypotheses": detection["hypotheses"],
-                "causal_chain": detection["causal_chain"],
                 "investigation": investigation,
                 "timeline": timeline[-80:],
             }
@@ -419,9 +588,35 @@ class TelemetryStore:
                 self.active_by_type[incident["type"]] = incident["id"]
                 self.active_by_fingerprint[incident.get("fingerprint", incident["type"])] = incident["id"]
             self._publish_locked({"type": "incident", "incident": incident})
+            self.persist_incident(incident)
             return True, "updated", incident
 
-    def start_ai_investigation(self, incident_id: str) -> tuple[bool, str, dict[str, Any] | None]:
+    @staticmethod
+    def sanitize_image_attachments(image_attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        attachments: list[dict[str, Any]] = []
+        for item in image_attachments or []:
+            url = str(item.get("image_url", ""))
+            if not url.startswith("data:image/"):
+                continue
+            detail = str(item.get("detail") or "high")
+            if detail not in {"auto", "low", "high"}:
+                detail = "high"
+            attachments.append(
+                {
+                    "type": "image_url",
+                    "image_url": url,
+                    "detail": detail,
+                    "captured_at": int(item.get("captured_at") or time.time()),
+                    "source": str(item.get("source") or "dashboard_chart"),
+                }
+            )
+            if len(attachments) >= 2:
+                break
+        return attachments
+
+    def start_ai_investigation(self, incident_id: str, image_attachments: list[dict[str, Any]] | None = None) -> tuple[bool, str, dict[str, Any] | None]:
+        requested_attachment_count = len(image_attachments or [])
+        attachments = self.sanitize_image_attachments(image_attachments)
         with self.lock:
             incident = next((item for item in self.incidents if item["id"] == incident_id), None)
             if incident is None:
@@ -439,10 +634,23 @@ class TelemetryStore:
                 incident["investigation"]["phase"] = "ai_root_cause_analysis"
                 incident["investigation"]["progress"] = max(int(incident["investigation"].get("progress", 0)), 70)
                 incident["investigation"]["updated_at"] = incident["ai_investigation"]["updated_at"]
+            if attachments:
+                incident["image_attachments"] = attachments
+                incident["dashboard_visual_context"] = self.dashboard_visual_context_locked(
+                    int(time.time()),
+                    has_image=True,
+                )
+            incident["visual_input_status"] = {
+                "requested": requested_attachment_count,
+                "accepted": len(attachments),
+                "attached_to_agent_request": bool(attachments),
+                "updated_at": int(time.time()),
+            }
             stream = list(self.points)
             settings = dict(self.settings)
             incident_copy = dict(incident)
             self._publish_locked({"type": "incident", "incident": incident})
+            self.persist_incident(incident)
 
         threading.Thread(
             target=self._run_ai_investigation_thread,
@@ -450,6 +658,162 @@ class TelemetryStore:
             daemon=True,
         ).start()
         return True, "started", incident
+
+    def start_ai_healthcheck(self, image_attachments: list[dict[str, Any]] | None = None) -> tuple[bool, str, dict[str, Any] | None]:
+        now = int(time.time())
+        requested_attachment_count = len(image_attachments or [])
+        attachments = self.sanitize_image_attachments(image_attachments)
+        with self.lock:
+            latest = dict(self.points[-1]) if self.points else {"t": float(now)}
+            stream = list(self.points)
+            settings = dict(self.settings)
+            incident = {
+                "id": f"inc-ai_healthcheck-{now}",
+                "fingerprint": "cockpit:ai_healthcheck",
+                "type": "ai_healthcheck",
+                "severity": "info",
+                "status": "active",
+                "created_at": now,
+                "started_at": now,
+                "activated_at": now,
+                "last_seen_at": now,
+                "quiet_samples": 0,
+                "consecutive_signal_count": 1,
+                "signal_count": 1,
+                "sample_count": len(stream),
+                "confirmations": 1,
+                "recovery_samples": 1,
+                "cooldown_seconds": 0,
+                "summary": "Operator requested an AI healthcheck of the current PostgreSQL cockpit state.",
+                "metric": "ai_healthcheck",
+                "value": 1,
+                "threshold": 1,
+                "confidence": 0,
+                "detector": {
+                    "id": "manual.ai_healthcheck.v1",
+                    "name": "AI healthcheck",
+                    "engine": "ai",
+                    "type": "ai_healthcheck",
+                    "signal_contract": "SuspiciousSignal.v1",
+                },
+                "evidence": [
+                    {"metric": key, "value": value, "role": "latest_telemetry"}
+                    for key, value in latest.items()
+                    if key != "t"
+                ],
+                "operational_events": list(self.operational_events)[-20:],
+                "investigation": {
+                    "state": "ai_inference",
+                    "phase": "ai_healthcheck",
+                    "progress": 70,
+                    "summary": "AI agent is checking the current telemetry, incidents, DBA context, and MCP tools.",
+                    "started_at": now,
+                    "updated_at": now,
+                    "steps": [
+                        {"id": "capture_snapshot", "label": "Capture current cockpit state", "status": "done", "detail": "Current telemetry, incidents, operational events, and settings were captured."},
+                        {"id": "summarize_dashboard", "label": "Capture dashboard window", "status": "done", "detail": "The last 15 minutes of visible metrics were summarized and the current chart screenshot was attached when available."},
+                        {"id": "ai_healthcheck", "label": "Run AI healthcheck", "status": "running", "detail": "The AI agent can inspect MCP tools and return a health verdict."},
+                    ],
+                },
+                "timeline": [
+                    {
+                        "t": now,
+                        "type": "ai_healthcheck",
+                        "source": "operator",
+                        "metric": "ai_healthcheck",
+                        "value": 1,
+                        "score": 0,
+                        "confidence": 0,
+                        "summary": "AI healthcheck requested.",
+                    }
+                ],
+                "notes": [],
+                "dashboard_visual_context": self.dashboard_visual_context_locked(now, has_image=bool(attachments)),
+                "image_attachments": attachments,
+                "visual_input_status": {
+                    "requested": requested_attachment_count,
+                    "accepted": len(attachments),
+                    "attached_to_agent_request": bool(attachments),
+                    "updated_at": now,
+                },
+                "ai_investigation": {
+                    "status": "running",
+                    "started_at": now,
+                    "updated_at": now,
+                },
+            }
+            self.incidents.append(incident)
+            self.active_by_type[incident["type"]] = incident["id"]
+            self.active_by_fingerprint[incident["fingerprint"]] = incident["id"]
+            incident_copy = dict(incident)
+            self._publish_locked({"type": "incident", "incident": incident})
+            self.persist_incident(incident)
+
+        threading.Thread(
+            target=self._run_ai_investigation_thread,
+            args=(incident["id"], incident_copy, stream, settings),
+            daemon=True,
+        ).start()
+        return True, "started", incident
+
+    def ensure_ai_chat_session(self, incident_id: str) -> tuple[bool, str, dict[str, Any] | None]:
+        with self.lock:
+            incident = next((item for item in self.incidents if item["id"] == incident_id), None)
+            if incident is None:
+                return False, "incident not found", None
+            existing = dict(incident.get("ai_investigation") or {})
+            if existing.get("chat_id") and existing.get("model_id"):
+                return True, "ready", dict(incident)
+
+        try:
+            agent = WhatareyatalkinaboutClient()
+            model_id = existing.get("model_id") or agent.ensure_model()
+            mcp_ids = existing.get("mcp_ids") or agent.ensure_mcp_ids()
+            chat_id = existing.get("chat_id") or agent.create_chat(incident_id, model_id, mcp_ids)
+        except AIAgentError as error:
+            return False, str(error), None
+
+        now = int(time.time())
+        with self.lock:
+            incident = next((item for item in self.incidents if item["id"] == incident_id), None)
+            if incident is None:
+                return False, "incident not found", None
+            incident["ai_investigation"] = {
+                **incident.get("ai_investigation", {}),
+                "status": incident.get("ai_investigation", {}).get("status", "chat_ready"),
+                "chat_id": chat_id,
+                "model_id": model_id,
+                "mcp_ids": mcp_ids,
+                "updated_at": now,
+            }
+            if incident.get("investigation") and incident["investigation"].get("state") not in {"ai_inference", "ai_complete"}:
+                incident["investigation"]["state"] = "ai_chat_ready"
+                incident["investigation"]["updated_at"] = now
+            self._publish_locked({"type": "incident", "incident": incident})
+            self.persist_incident(incident)
+            return True, "ready", dict(incident)
+
+    def dashboard_visual_context_locked(self, now: int, window_seconds: int = 900, has_image: bool = False) -> dict[str, Any]:
+        points = [point for point in self.points if int(point.get("t", 0)) >= now - window_seconds]
+        series_summary: dict[str, dict[str, float]] = {}
+        for metric in QUERIES:
+            values = [float(point.get(metric, 0) or 0) for point in points if metric in point]
+            if not values:
+                continue
+            series_summary[metric] = {
+                "last": round(values[-1], 3),
+                "min": round(min(values), 3),
+                "max": round(max(values), 3),
+                "avg": round(sum(values) / len(values), 3),
+            }
+        return {
+            "kind": "dashboard_textual_surrogate",
+            "window_seconds": window_seconds,
+            "points": len(points),
+            "image_attached": has_image,
+            "note": "Text summary of the dashboard chart; when image_attached=true the AI request also contains a PNG screenshot of the visible chart.",
+            "series_summary": series_summary,
+        }
 
     def _run_ai_investigation_thread(
         self,
@@ -487,6 +851,7 @@ class TelemetryStore:
                 current["investigation"]["phase"] = "ai_unavailable"
                 current["investigation"]["updated_at"] = int(time.time())
             self._publish_locked({"type": "incident", "incident": current})
+            self.persist_incident(current)
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -724,6 +1089,7 @@ def poll_prometheus(store: TelemetryStore, interval: float, stop: threading.Even
             store.add_point(point)
             store.add_operational_events_from_point(point)
             store.add_settings_snapshot(query_settings(), now)
+            store.collect_query_fingerprint_snapshot(now)
         except Exception as error:
             print(f"telemetry poll failed: {error}", flush=True)
         stop.wait(interval)
@@ -754,6 +1120,10 @@ class Handler(SimpleHTTPRequestHandler):
                 self.write_json({"ok": False, "message": "incident not found"}, status=404)
                 return
             self.write_json({"ok": True, "incident": incident})
+            return
+        if parsed.path.startswith("/api/chats/") and parsed.path.endswith("/messages"):
+            incident_id = parsed.path.removeprefix("/api/chats/").removesuffix("/messages")
+            self.handle_chat_messages(incident_id)
             return
         if parsed.path == "/events":
             self.handle_events()
@@ -786,9 +1156,24 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/incidents/ai":
             payload = self.read_json()
-            ok, message, incident = self.store.start_ai_investigation(str(payload.get("id", "")))
+            ok, message, incident = self.store.start_ai_investigation(
+                str(payload.get("id", "")),
+                list(payload.get("image_attachments", [])),
+            )
             status = 200 if ok else 404 if message == "incident not found" else 409
             self.write_json({"ok": ok, "message": message, "incident": incident}, status=status)
+            return
+        if parsed.path == "/api/ai/healthcheck":
+            payload = self.read_json()
+            ok, message, incident = self.store.start_ai_healthcheck(list(payload.get("image_attachments", [])))
+            self.write_json({"ok": ok, "message": message, "incident": incident}, status=200 if ok else 409)
+            return
+        if parsed.path == "/api/incidents/chat/stream":
+            payload = self.read_json()
+            self.handle_incident_chat_stream(
+                str(payload.get("id", "")),
+                str(payload.get("message", "")),
+            )
             return
         if parsed.path == "/api/detectors":
             payload = self.read_json()
@@ -830,6 +1215,76 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def write_sse_event(self, event: dict[str, Any]) -> None:
+        self.wfile.write(("data: " + json.dumps(event, ensure_ascii=False) + "\n\n").encode("utf-8"))
+        self.wfile.flush()
+
+    def handle_incident_chat_stream(self, incident_id: str, message: str) -> None:
+        if not message.strip():
+            self.write_json({"ok": False, "message": "message is required"}, status=400)
+            return
+        if not ai_agent_enabled():
+            self.write_json({"ok": False, "message": "AI agent backend is not configured"}, status=409)
+            return
+        ok, status_message, incident = self.store.ensure_ai_chat_session(incident_id)
+        if not ok or not incident:
+            self.write_json({"ok": False, "message": status_message}, status=404 if status_message == "incident not found" else 409)
+            return
+        chat_id = str(incident.get("ai_investigation", {}).get("chat_id", ""))
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.write_sse_event({"type": "cockpit_status", "status": "connected", "chat_id": chat_id, "incident_id": incident_id})
+        try:
+            agent = WhatareyatalkinaboutClient(timeout=float(os.environ.get("AI_AGENT_STREAM_TIMEOUT", "300")))
+            for line in agent.stream_completion_lines(chat_id, message):
+                self.wfile.write(line.encode("utf-8"))
+                self.wfile.flush()
+        except Exception as error:
+            self.write_sse_event({"type": "error", "error": str(error)})
+
+    def handle_chat_messages(self, incident_id: str) -> None:
+        incident = self.store.get_incident(incident_id)
+        if incident is None:
+            self.write_json({"ok": False, "message": "incident not found"}, status=404)
+            return
+        chat_id = str(incident.get("ai_investigation", {}).get("chat_id") or "")
+        if not chat_id:
+            self.write_json({"ok": True, "messages": []})
+            return
+        try:
+            messages = WhatareyatalkinaboutClient(timeout=30).get_messages(chat_id)
+        except AIAgentError as error:
+            self.write_json({"ok": False, "message": str(error)}, status=409)
+            return
+        mapped: list[dict[str, Any]] = []
+        for item in messages:
+            role = str(item.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content_type = str(item.get("content_type") or "text")
+            content = str(item.get("content") or "")
+            if content_type == "multimodal":
+                try:
+                    parts = json.loads(content)
+                    content = "\n".join(str(part.get("text", "")) for part in parts if isinstance(part, dict) and part.get("type") == "text")
+                except json.JSONDecodeError:
+                    pass
+            if not content.strip():
+                continue
+            mapped.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "meta": "history",
+                    "t": int(time.time()),
+                }
+            )
+        self.write_json({"ok": True, "messages": mapped[-80:]})
 
     def handle_events(self) -> None:
         client = self.store.subscribe()
@@ -877,9 +1332,21 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--max-points", type=int, default=720)
     parser.add_argument("--max-detections", type=int, default=200)
+    parser.add_argument("--no-persistence", action="store_true")
     args = parser.parse_args()
 
-    store = TelemetryStore(max_points=args.max_points, max_detections=args.max_detections)
+    persistence: Persistence = NoopPersistence()
+    if not args.no_persistence and os.environ.get("COCKPIT_PERSISTENCE", "postgres") != "off":
+        try:
+            persistence = PostgresPersistence()
+            persistence.ensure_schema()
+            print("Cockpit persistence: postgres incident/signal/verdict storage enabled.")
+        except Exception as error:
+            print(f"Cockpit persistence disabled: {error}", flush=True)
+            persistence = NoopPersistence()
+
+    store = TelemetryStore(max_points=args.max_points, max_detections=args.max_detections, persistence=persistence)
+    store.hydrate_from_persistence(args.max_detections)
     Handler.store = store
     stop = threading.Event()
     poller = threading.Thread(target=poll_prometheus, args=(store, args.interval, stop), daemon=True)
@@ -887,7 +1354,7 @@ def main() -> None:
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Cockpit backend: http://{args.host}:{args.port}")
-    print("Telemetry retention: rolling memory window only; Prometheus keeps its own 2d TSDB retention.")
+    print("Telemetry retention: rolling memory window; incidents/signals/verdicts persist in Postgres when available.")
     try:
         server.serve_forever()
     finally:

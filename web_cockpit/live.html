@@ -17,6 +17,7 @@
         <button id="openBenchmarkLab" type="button">Benchmark lab</button>
         <button id="stopLoad" type="button">Stop</button>
         <button id="openExperimentLab" type="button">DBA lab</button>
+        <button id="runAiHealthcheck" type="button">AI healthcheck</button>
         <label>
           Detector
           <select id="detectorPicker">
@@ -98,6 +99,17 @@
       <button class="status-action" data-status="false_positive" type="button">False positive</button>
     </div>
     <section class="tab-panel active" id="tab-diagnosis"></section>
+    <section class="incident-chat" aria-label="AI incident chat">
+      <div class="report-block-head">
+        <strong>AI incident chat</strong>
+        <span id="aiChatStatus" class="chat-status">idle</span>
+      </div>
+      <div id="aiChatMessages" class="chat-messages"></div>
+      <form id="aiChatForm" class="chat-form">
+        <textarea id="aiChatInput" rows="3" placeholder="Add context or ask about this incident"></textarea>
+        <button id="sendAiChat" type="submit">Send</button>
+      </form>
+    </section>
   </aside>
 
   <div class="drawer-backdrop" id="experimentBackdrop" hidden></div>

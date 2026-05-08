@@ -66,6 +66,7 @@ const benchmarkState = document.getElementById("benchmarkState");
 const loadOutput = document.getElementById("loadOutput");
 const detectorPicker = document.getElementById("detectorPicker");
 const openExperimentLab = document.getElementById("openExperimentLab");
+const runAiHealthcheck = document.getElementById("runAiHealthcheck");
 const openReport = document.getElementById("openReport");
 const drawer = document.getElementById("reportDrawer");
 const backdrop = document.getElementById("drawerBackdrop");
@@ -80,6 +81,16 @@ const experimentList = document.getElementById("experimentList");
 const statusActions = document.querySelectorAll(".status-action");
 const refreshIncident = document.getElementById("refreshIncident");
 const runAiInvestigation = document.getElementById("runAiInvestigation");
+const aiChatStatus = document.getElementById("aiChatStatus");
+const aiChatMessages = document.getElementById("aiChatMessages");
+const aiChatForm = document.getElementById("aiChatForm");
+const aiChatInput = document.getElementById("aiChatInput");
+const sendAiChat = document.getElementById("sendAiChat");
+
+let chatMessagesByIncident = {};
+let chatHistoryLoaded = new Set();
+let activeChatAbort = null;
+let activeChatIncidentId = null;
 
 function formatValue(value) {
   if (value == null) return "--";
@@ -96,6 +107,56 @@ function formatClock(epochSeconds) {
 function formatRangeLabel(firstT, lastT) {
   if (!firstT || !lastT) return "Waiting for telemetry";
   return `${new Date(firstT * 1000).toLocaleString()} - ${new Date(lastT * 1000).toLocaleTimeString()}`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function renderMarkdown(value) {
+  const escaped = escapeHtml(value);
+  const blocks = escaped.split(/```/);
+  let html = "";
+  blocks.forEach((block, index) => {
+    if (index % 2 === 1) {
+      html += "<pre><code>" + block.replace(/^\w+\n/, "") + "</code></pre>";
+      return;
+    }
+    const lines = block.split("\n");
+    let inList = false;
+    lines.forEach((line) => {
+      const bullet = line.match(/^\s*[-*]\s+(.+)/);
+      if (bullet) {
+        if (!inList) {
+          html += "<ul>";
+          inList = true;
+        }
+        html += "<li>" + bullet[1] + "</li>";
+        return;
+      }
+      if (inList) {
+        html += "</ul>";
+        inList = false;
+      }
+      if (!line.trim()) return;
+      let text = line
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      if (/^#{1,4}\s+/.test(text)) {
+        text = text.replace(/^#{1,4}\s+/, "");
+        html += "<h4>" + text + "</h4>";
+      } else {
+        html += "<p>" + text + "</p>";
+      }
+    });
+    if (inList) html += "</ul>";
+  });
+  return html || "<p></p>";
 }
 
 function scale(value, min, max, outMin, outMax) {
@@ -440,6 +501,46 @@ function renderChart() {
   };
 }
 
+function captureChartImage() {
+  if (!chart || !chart.innerHTML.trim()) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const clone = chart.cloneNode(true);
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    clone.setAttribute("width", "860");
+    clone.setAttribute("height", "320");
+    const style = document.createElementNS("http://www.w3.org/2000/svg", "style");
+    style.textContent = `
+      .plot-bg{fill:#f7f9fc}.grid-line{stroke:#d8dee8;stroke-width:1}.grid-line.vertical{stroke-dasharray:3 5}
+      .axis{stroke:#6d7a8a;stroke-width:1.2}.axis-title,.tick-label{fill:#607080;font-family:Inter,Arial,sans-serif;font-size:11px}
+      .series{fill:none;stroke:#2563eb;stroke-width:2.6;stroke-linejoin:round;stroke-linecap:round}
+      .threshold{stroke:#ef4444;stroke-width:1.4;stroke-dasharray:4 5}.incident-band{fill:rgba(239,68,68,.1)}
+      .anomaly-line{stroke:#ef4444;stroke-width:1.5;stroke-dasharray:4 5}.anomaly-dot{fill:#ef4444;stroke:#fff;stroke-width:2}
+      .anomaly-hit,.plot-hit,.brush{display:none}.incident-marker.resolved .anomaly-dot{fill:#64748b}
+    `;
+    clone.insertBefore(style, clone.firstChild);
+    const svgText = new XMLSerializer().serializeToString(clone);
+    const blob = new Blob([svgText], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 860;
+      canvas.height = 320;
+      const context = canvas.getContext("2d");
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL("image/png"));
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    };
+    image.src = url;
+  });
+}
+
 function renderMetricsStrip() {
   const point = stream.at(-1) ?? {};
   const primary = ["active_connections", "waiting_connections", "xact_rate", "vacuum_max_elapsed_seconds"];
@@ -551,6 +652,7 @@ function incidentReportVersion(incident) {
     incident.ai_investigation?.status,
     incident.ai_investigation?.updated_at,
     incident.ai_verdict?.verdict,
+    incident.image_attachments?.length ?? 0,
     showAllOps ? "all-ops" : "latest-ops"
   ].join("|");
 }
@@ -560,25 +662,14 @@ function renderReport(options = {}) {
   if (!incident) return;
   const reportOpen = drawer.classList.contains("open");
   const version = incidentReportVersion(incident);
-  if (!options.force && reportOpen && reportRenderedIncidentId === incident.id && reportRenderedVersion === version) {
-    return;
-  }
+  if (!options.force && reportOpen && reportRenderedIncidentId === incident.id && reportRenderedVersion === version) return;
   const previousScroll = drawer.scrollTop;
   const selection = window.getSelection();
-  const hasTextSelection = selection && selection.type === "Range";
-  if (!options.force && reportOpen && hasTextSelection) {
-    return;
-  }
+  if (!options.force && reportOpen && selection && selection.type === "Range") return;
   document.getElementById("reportTitle").textContent = incident.type;
   const detector = incident.detector ?? { name: "Unknown detector", engine: "unknown" };
   const evidenceRows = (incident.evidence ?? []).map((item) => (
     "<tr><td>" + item.metric + "</td><td>" + formatValue(item.value) + "</td><td>" + (item.threshold ?? item.role ?? "") + "</td></tr>"
-  )).join("");
-  const hypotheses = (incident.hypotheses ?? []).map((item) => (
-    '<div class="hypothesis"><div class="hypothesis-head"><strong>' + item.cause + '</strong><span>' + formatValue((item.score ?? 0) * 100) + "%</span></div><p>" + item.why + "</p></div>"
-  )).join("");
-  const chain = (incident.causal_chain ?? []).map((item) => (
-    '<div class="chain-step done"><span>' + item.stage + '</span><strong>' + item.label + '</strong><small>' + item.detail + '</small></div>'
   )).join("");
   const allOps = (incident.operational_events ?? operationalEvents).slice().sort((left, right) => (right.t ?? 0) - (left.t ?? 0));
   const visibleOps = showAllOps ? allOps : allOps.slice(0, 5);
@@ -590,38 +681,46 @@ function renderReport(options = {}) {
   const investigationSteps = (investigation.steps ?? []).map((item) => (
     '<li class="investigation-step ' + item.status + '"><span class="status-pill">' + item.status + '</span><div><strong>' + item.label + '</strong><p>' + item.detail + '</p></div></li>'
   )).join("");
-  const nextActions = (investigation.next_actions ?? []).map((item) => "<li>" + item + "</li>").join("");
   const timeline = (incident.timeline ?? []).slice(-12).reverse().map((item) => (
-    '<li><strong>' + item.type + '</strong><span>' + formatClock(item.t) + ' - ' + item.metric + ' = ' + formatValue(item.value) + ' · score ' + formatValue(item.score) + '</span></li>'
+    '<li><strong>' + item.type + '</strong><span>' + formatClock(item.t) + ' - ' + item.metric + ' = ' + formatValue(item.value) + ' - score ' + formatValue(item.score) + '</span></li>'
   )).join("");
   const ai = incident.ai_investigation ?? {};
   const aiVerdict = incident.ai_verdict ?? ai.verdict;
   const aiChain = (aiVerdict?.causal_chain ?? []).map((item) => (
-    '<div class="chain-step done"><span>' + (item.stage ?? "evidence") + '</span><strong>' + (item.detail ?? "") + '</strong></div>'
+    '<li><span>' + (item.stage ?? "evidence") + '</span><p>' + (item.detail ?? "") + '</p></li>'
   )).join("");
   const aiEvidence = (aiVerdict?.supporting_evidence ?? []).map((item) => "<li>" + item + "</li>").join("");
+  const aiNegativeEvidence = (aiVerdict?.negative_evidence ?? []).map((item) => "<li>" + item + "</li>").join("");
+  const aiVisualObservations = (aiVerdict?.visual_observations ?? []).map((item) => "<li>" + item + "</li>").join("");
   const aiActions = (aiVerdict?.recommended_actions ?? []).map((item) => "<li>" + item + "</li>").join("");
+  const aiNeedsMoreData = (aiVerdict?.needs_more_data ?? []).map((item) => "<li>" + item + "</li>").join("");
+  const visualStatus = incident.visual_input_status
+    ? '<p class="visual-status">Visual inputs: ' + incident.visual_input_status.accepted + ' accepted from ' + incident.visual_input_status.requested + ' requested.</p>'
+    : "";
+  const visualEvidence = (incident.image_attachments ?? []).map((item) => (
+    '<figure class="visual-evidence"><img src="' + item.image_url + '" alt="Dashboard chart captured for AI analysis"><figcaption>' + (item.source ?? "dashboard chart") + " captured " + formatClock(item.captured_at) + '</figcaption></figure>'
+  )).join("");
+  const visualEvidenceBlock = visualEvidence || visualStatus
+    ? '<div class="report-block"><strong>Visual evidence for AI</strong>' + visualStatus + visualEvidence + '</div>'
+    : "";
   const aiBlock = aiVerdict
-    ? '<div class="report-block ai-verdict"><strong>AI verdict</strong><p><span class="status-pill">' + (ai.status ?? "complete") + '</span> confidence ' + formatValue((aiVerdict.confidence ?? 0) * 100) + '%</p><h2>' + (aiVerdict.verdict ?? "Verdict ready") + '</h2><p>' + (aiVerdict.root_cause ?? "") + '</p><div class="chain">' + aiChain + '</div><strong>Supporting evidence</strong><ul class="next-actions">' + (aiEvidence || "<li>No supporting evidence returned.</li>") + '</ul><strong>Recommended actions</strong><ul class="next-actions">' + (aiActions || "<li>No recommended actions returned.</li>") + '</ul></div>'
-    : '<div class="report-block"><strong>AI verdict</strong><p>' + (ai.status === "running" ? "AI investigation is running." : ai.status === "failed" ? "AI investigation failed: " + (ai.error ?? "unknown error") : "AI investigation has not been started for this incident.") + '</p></div>';
+    ? '<div class="report-block ai-verdict"><div class="ai-verdict-head"><div><strong>AI verdict</strong><h3>' + (aiVerdict.verdict ?? "Verdict ready") + '</h3></div><span class="status-pill">' + formatValue((aiVerdict.confidence ?? 0) * 100) + '% confidence</span></div><p class="ai-root-cause">' + (aiVerdict.root_cause ?? "") + '</p><div class="ai-section"><strong>Causal chain</strong><ol class="ai-chain">' + (aiChain || '<li><span>pending</span><p>No causal chain returned.</p></li>') + '</ol></div><div class="ai-section"><strong>Visual observations</strong><ul class="next-actions">' + (aiVisualObservations || "<li>No visual observations returned.</li>") + '</ul></div><div class="ai-evidence-grid"><div><strong>Supporting evidence</strong><ul class="next-actions">' + (aiEvidence || "<li>No supporting evidence returned.</li>") + '</ul></div><div><strong>Negative evidence</strong><ul class="next-actions">' + (aiNegativeEvidence || "<li>No negative evidence returned.</li>") + '</ul></div></div><div class="ai-evidence-grid"><div><strong>Recommended actions</strong><ul class="next-actions">' + (aiActions || "<li>No recommended actions returned.</li>") + '</ul></div><div><strong>Needs more data</strong><ul class="next-actions">' + (aiNeedsMoreData || "<li>No extra data requested.</li>") + '</ul></div></div></div>'
+    : '<div class="report-block ai-verdict pending"><strong>AI verdict</strong><p>' + (ai.status === "running" ? "AI investigation is running." : ai.status === "failed" ? "AI investigation failed: " + (ai.error ?? "unknown error") : "AI investigation has not been started for this incident.") + '</p></div>';
   runAiInvestigation.disabled = ai.status === "running" || !aiAgent.enabled;
   runAiInvestigation.title = aiAgent.enabled ? "Run AI root-cause investigation" : "AI agent backend is not configured";
   document.getElementById("tab-diagnosis").innerHTML =
     '<div class="report-block"><strong>Status</strong><p><span class="status-pill">' + incident.status + "</span> confidence " + formatValue((incident.confidence ?? 0) * 100) + "%</p></div>" +
-    '<div class="report-block"><strong>Incident period</strong><p>' + formatClock(incident.started_at ?? incident.created_at) + " - " + formatClock(incident.resolved_at ?? incident.last_seen_at) + " · signals " + (incident.signal_count ?? 1) + " · fingerprint " + (incident.fingerprint ?? incident.type) + '</p></div>' +
+    '<div class="report-block"><strong>Incident period</strong><p>' + formatClock(incident.started_at ?? incident.created_at) + " - " + formatClock(incident.resolved_at ?? incident.last_seen_at) + " - signals " + (incident.signal_count ?? 1) + " - fingerprint " + (incident.fingerprint ?? incident.type) + '</p></div>' +
     '<div class="report-block"><strong>Investigation process</strong><div class="investigation-header"><div><span class="status-pill">' + (investigation.state ?? "queued") + '</span><strong>' + (investigation.phase ?? "queued") + '</strong><p>' + (investigation.summary ?? "Waiting for incident evidence.") + '</p></div><div class="progress-ring" style="--progress:' + Math.max(0, Math.min(100, investigation.progress ?? 0)) + '%"><span>' + formatValue(investigation.progress ?? 0) + '%</span></div></div><ol class="investigation-list">' + investigationSteps + '</ol></div>' +
-    '<div class="report-block"><strong>Inference engine</strong><p>' + (investigation.engine?.mode ?? "hybrid inference") + " · " + (investigation.engine?.current ?? "active detector pipeline") + '</p></div>' +
     aiBlock +
-    '<div class="report-block"><strong>Detector</strong><p>' + detector.name + " · engine: " + detector.engine + '</p></div>' +
+    visualEvidenceBlock +
+    '<div class="report-block"><strong>Detector</strong><p>' + detector.name + " - engine: " + detector.engine + '</p></div>' +
     '<div class="report-block"><strong>Detected metric</strong><p>' + incident.metric + " = " + formatValue(incident.value) + " threshold " + formatValue(incident.threshold) + '</p></div>' +
-    '<div class="report-block"><strong>Time window</strong><p>' + formatClock(incident.created_at) + " - " + formatClock(incident.last_seen_at) + " · samples " + incident.sample_count + '</p></div>' +
-    '<div class="report-block"><strong>Interpretation</strong><p>' + incident.summary + '</p></div>' +
-    '<div class="report-block"><strong>Causal chain draft</strong><div class="chain">' + chain + '</div></div>' +
-    '<div class="report-block"><strong>Competing hypotheses</strong><div class="hypothesis-list">' + hypotheses + '</div></div>' +
+    '<div class="report-block"><strong>Time window</strong><p>' + formatClock(incident.created_at) + " - " + formatClock(incident.last_seen_at) + " - samples " + incident.sample_count + '</p></div>' +
+    '<div class="report-block"><strong>Detector interpretation</strong><p>' + incident.summary + '</p></div>' +
     '<div class="report-block"><strong>Signal timeline</strong><ol class="ops-list">' + (timeline || '<li><span>No signals captured yet.</span></li>') + '</ol></div>' +
     '<div class="report-block"><div class="report-block-head"><strong>DBA and maintenance context</strong>' + (allOps.length > 5 ? '<button id="toggleOps" type="button">' + (showAllOps ? 'Show latest 5' : 'Show all ' + allOps.length) + '</button>' : '') + '</div><ol class="ops-list">' + (relatedOps || '<li><span>No config reload, pg_settings change, or long VACUUM event near this incident yet.</span></li>') + '</ol>' + (!showAllOps && hiddenOpsCount ? '<p class="ops-summary">' + hiddenOpsCount + ' older events hidden.</p>' : '') + '</div>' +
-    '<div class="report-block"><strong>Evidence</strong><table class="report-table"><thead><tr><th>Metric</th><th>Value</th><th>Comparator</th></tr></thead><tbody>' + evidenceRows + '</tbody></table></div>' +
-    '<div class="report-block"><strong>Next actions</strong><ul class="next-actions">' + nextActions + '</ul></div>';
+    '<div class="report-block"><strong>Evidence</strong><table class="report-table"><thead><tr><th>Metric</th><th>Value</th><th>Comparator</th></tr></thead><tbody>' + evidenceRows + '</tbody></table></div>';
   const toggleOps = document.getElementById("toggleOps");
   if (toggleOps) {
     toggleOps.addEventListener("click", () => {
@@ -634,8 +733,58 @@ function renderReport(options = {}) {
   if (!options.force && reportOpen) {
     drawer.scrollTop = previousScroll;
   }
+  renderAiChat();
+  loadAiChatHistory(incident.id);
 }
 
+function chatMessagesForIncident(id) {
+  if (!chatMessagesByIncident[id]) chatMessagesByIncident[id] = [];
+  return chatMessagesByIncident[id];
+}
+
+function appendChatMessage(incidentId, role, content, meta = "") {
+  const messages = chatMessagesForIncident(incidentId);
+  messages.push({ role, content, meta, t: Math.floor(Date.now() / 1000) });
+  if (messages.length > 80) messages.splice(0, messages.length - 80);
+}
+
+async function loadAiChatHistory(incidentId) {
+  if (chatHistoryLoaded.has(incidentId)) return;
+  const incident = incidents.find((item) => item.id === incidentId);
+  if (!incident?.ai_investigation?.chat_id) return;
+  chatHistoryLoaded.add(incidentId);
+  try {
+    const response = await fetch(API_BASE + "/api/chats/" + encodeURIComponent(incidentId) + "/messages");
+    if (!response.ok) return;
+    const data = await response.json();
+    if (!Array.isArray(data.messages) || !data.messages.length) return;
+    if (chatMessagesForIncident(incidentId).length === 0) {
+      chatMessagesByIncident[incidentId] = data.messages;
+      renderAiChat({ stickToBottom: true });
+    }
+  } catch (error) {
+    chatHistoryLoaded.delete(incidentId);
+  }
+}
+
+function renderAiChat(options = {}) {
+  const incident = selectedIncident();
+  if (!incident) return;
+  const messages = chatMessagesForIncident(incident.id);
+  const nearBottom = aiChatMessages.scrollHeight - aiChatMessages.scrollTop - aiChatMessages.clientHeight < 48;
+  const chatBusy = Boolean(activeChatAbort) && activeChatIncidentId === incident.id;
+  aiChatStatus.textContent = aiAgent.enabled
+    ? (chatBusy ? aiChatStatus.textContent : incident.ai_investigation?.status === "running" ? "AI investigation running" : "ready")
+    : "not configured";
+  sendAiChat.disabled = !aiAgent.enabled || chatBusy;
+  aiChatInput.disabled = !aiAgent.enabled || chatBusy;
+  aiChatMessages.innerHTML = messages.length
+    ? messages.map((item) => '<div class="chat-message ' + item.role + '"><strong>' + escapeHtml(item.role) + '</strong><div class="chat-markdown">' + renderMarkdown(item.content) + '</div>' + (item.meta ? '<span>' + escapeHtml(item.meta) + '</span>' : '') + '</div>').join("")
+    : '<div class="chat-empty">Start a scoped conversation about this incident or healthcheck.</div>';
+  if (options.stickToBottom || nearBottom) {
+    aiChatMessages.scrollTop = aiChatMessages.scrollHeight;
+  }
+}
 async function loadIncident(id) {
   const response = await fetch(API_BASE + "/api/incidents/" + encodeURIComponent(id));
   if (!response.ok) return null;
@@ -723,6 +872,94 @@ async function postJson(url, payload) {
     throw new Error(data.message);
   }
   return response.json();
+}
+
+async function streamAiChat(incidentId, message) {
+  activeChatAbort = new AbortController();
+  activeChatIncidentId = incidentId;
+  sendAiChat.disabled = true;
+  aiChatInput.disabled = true;
+  aiChatStatus.textContent = "connecting";
+  let assistantIndex = null;
+  let buffer = "";
+  let doneReceived = false;
+  try {
+    const response = await fetch(API_BASE + "/api/incidents/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: incidentId, message }),
+      signal: activeChatAbort.signal,
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({ message: response.statusText }));
+      throw new Error(data.message);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const messages = chatMessagesForIncident(incidentId);
+    messages.push({ role: "assistant", content: "", meta: "streaming", t: Math.floor(Date.now() / 1000) });
+    assistantIndex = messages.length - 1;
+    renderAiChat({ stickToBottom: true });
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+      for (const frame of frames) {
+        const line = frame.split("\n").find((item) => item.startsWith("data: "));
+        if (!line) continue;
+        const event = JSON.parse(line.slice(6));
+        const type = String(event.type ?? "");
+        if (type === "chunk") {
+          messages[assistantIndex].content += event.content ?? "";
+          messages[assistantIndex].meta = "answering";
+        } else if (type === "reasoning") {
+          aiChatStatus.textContent = "reasoning";
+        } else if (type === "tool_calls" || type === "tool_call_delta") {
+          aiChatStatus.textContent = "calling MCP tools";
+        } else if (type === "tool_results") {
+          aiChatStatus.textContent = "reading tool results";
+        } else if (type === "compact_started" || type === "compact") {
+          aiChatStatus.textContent = "compacting context";
+        } else if (type === "subagent_started" || type === "subagent_progress") {
+          aiChatStatus.textContent = "subagent working";
+        } else if (type === "done") {
+          messages[assistantIndex].meta = "done";
+          aiChatStatus.textContent = "ready";
+          doneReceived = true;
+          activeChatAbort = null;
+          activeChatIncidentId = null;
+          await reader.cancel().catch(() => {});
+          renderAiChat();
+          return;
+        } else if (type === "error") {
+          messages[assistantIndex].meta = "error";
+          messages[assistantIndex].content += "\n" + (event.error ?? "stream error");
+          aiChatStatus.textContent = "error";
+          doneReceived = true;
+          activeChatAbort = null;
+          activeChatIncidentId = null;
+          await reader.cancel().catch(() => {});
+          renderAiChat();
+          return;
+        } else if (type === "cockpit_status") {
+          aiChatStatus.textContent = "connected";
+        }
+        renderAiChat();
+      }
+    }
+  } finally {
+    activeChatAbort = null;
+    activeChatIncidentId = null;
+    if (!doneReceived && assistantIndex != null) {
+      const messages = chatMessagesForIncident(incidentId);
+      if (messages[assistantIndex]?.meta === "streaming" || messages[assistantIndex]?.meta === "answering") {
+        messages[assistantIndex].meta = "done";
+      }
+    }
+    renderAiChat();
+  }
 }
 
 function openDrawer() {
@@ -934,6 +1171,27 @@ refreshIncident.addEventListener("click", async () => {
   }
 });
 
+aiChatForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const incident = selectedIncident();
+  const message = aiChatInput.value.trim();
+  if (!incident || !message) return;
+  if (!aiAgent.enabled) {
+    aiChatStatus.textContent = "not configured";
+    return;
+  }
+  appendChatMessage(incident.id, "user", message);
+  aiChatInput.value = "";
+  renderAiChat({ stickToBottom: true });
+  try {
+    await streamAiChat(incident.id, message);
+  } catch (error) {
+    appendChatMessage(incident.id, "assistant", error.message, "error");
+    aiChatStatus.textContent = "error";
+    renderAiChat();
+  }
+});
+
 runAiInvestigation.addEventListener("click", async () => {
   const incident = selectedIncident();
   if (!incident) return;
@@ -943,9 +1201,44 @@ runAiInvestigation.addEventListener("click", async () => {
   }
   runAiInvestigation.disabled = true;
   try {
-    const data = await postJson("/api/incidents/ai", { id: incident.id });
+    statusSubtitle.textContent = "Capturing chart and starting AI investigation...";
+    const chartImage = await captureChartImage();
+    const capturedAt = Math.floor(Date.now() / 1000);
+    if (chartImage) {
+      upsertIncident({
+        ...incident,
+        image_attachments: [{
+          type: "image_url",
+          image_url: chartImage,
+          detail: "high",
+          source: "dashboard_chart",
+          captured_at: capturedAt,
+        }],
+        visual_input_status: {
+          requested: 1,
+          accepted: 1,
+          attached_to_agent_request: true,
+          updated_at: capturedAt,
+        },
+      });
+      renderReport({ force: true });
+    } else {
+      statusSubtitle.textContent = "Could not capture chart image; starting AI investigation with textual telemetry only.";
+    }
+    const payload = chartImage ? {
+      id: incident.id,
+      image_attachments: [{
+        type: "image_url",
+        image_url: chartImage,
+        detail: "high",
+        source: "dashboard_chart",
+        captured_at: capturedAt,
+      }],
+    } : { id: incident.id };
+    const data = await postJson("/api/incidents/ai", payload);
     if (data.incident) {
       upsertIncident(data.incident);
+      selectIncident(data.incident.id, true);
       renderStatus();
       renderIncidents();
       renderReport({ force: true });
@@ -954,6 +1247,38 @@ runAiInvestigation.addEventListener("click", async () => {
     statusSubtitle.textContent = error.message;
   } finally {
     runAiInvestigation.disabled = false;
+  }
+});
+
+runAiHealthcheck.addEventListener("click", async () => {
+  if (!aiAgent.enabled) {
+    statusSubtitle.textContent = "AI agent backend is not configured.";
+    return;
+  }
+  runAiHealthcheck.disabled = true;
+  try {
+    statusSubtitle.textContent = "Capturing chart and starting AI healthcheck...";
+    const chartImage = await captureChartImage();
+    const capturedAt = Math.floor(Date.now() / 1000);
+    const payload = chartImage ? {
+      image_attachments: [{
+        type: "image_url",
+        image_url: chartImage,
+        detail: "high",
+        source: "dashboard_chart",
+        captured_at: capturedAt,
+      }],
+    } : {};
+    const data = await postJson("/api/ai/healthcheck", payload);
+    if (data.incident) {
+      upsertIncident(data.incident);
+      selectIncident(data.incident.id, true);
+      statusSubtitle.textContent = "AI healthcheck started.";
+    }
+  } catch (error) {
+    statusSubtitle.textContent = error.message;
+  } finally {
+    runAiHealthcheck.disabled = false;
   }
 });
 

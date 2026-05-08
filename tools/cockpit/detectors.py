@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-
 SIGNAL_CONTRACT = "SuspiciousSignal.v1"
 
 
@@ -105,95 +104,34 @@ def detector_meta(detector_id: str, name: str, engine: str, detector_type: str) 
     }
 
 
-def build_hypotheses(signal: dict[str, Any], point: dict[str, float]) -> list[dict[str, Any]]:
-    kind = signal["type"]
-    active = point.get("active_connections", 0)
-    waiting = point.get("waiting_connections", 0)
-    read_time = point.get("blk_read_time_ms_rate", 0)
-    read_blocks = point.get("read_blocks_rate", 0)
-    vacuum_elapsed = point.get("vacuum_max_elapsed_seconds", 0)
-    vacuum_sessions = point.get("active_vacuum_sessions", 0) + point.get("active_autovacuum_sessions", 0)
-    if kind == "high_concurrency":
-        return [
-            {"cause": "pgbench_or_application_load_spike", "score": 0.72 if active >= 24 else 0.45, "why": "Active sessions crossed the concurrency threshold while the load generator may be running."},
-            {"cause": "connection_pool_misconfiguration", "score": 0.43, "why": "High active count can also come from missing pool limits or bursty client pools."},
-        ]
-    if kind == "wait_contention":
-        return [
-            {"cause": "lock_contention_or_slow_queries", "score": 0.76 if waiting >= 2 else 0.4, "why": "Waiting sessions appeared; lock waits and slow query pressure are the first checks."},
-            {"cause": "downstream_resource_saturation", "score": 0.58 if read_time >= 50 else 0.34, "why": "Waits can be amplified by IO pressure or saturated database workers."},
-        ]
-    if kind == "vacuum_pressure":
-        return [
-            {"cause": "manual_vacuum_or_autovacuum_overlap", "score": 0.8 if vacuum_elapsed >= 30 else 0.42, "why": "VACUUM is active during the incident window and can compete for IO, locks, and buffer cache."},
-            {"cause": "maintenance_window_misconfiguration", "score": 0.58 if vacuum_sessions > 0 else 0.25, "why": "Maintenance work appears during foreground workload; check DBA operations and autovacuum settings."},
-        ]
-    if kind == "throughput_rise":
-        return [
-            {"cause": "workload_start_or_traffic_surge", "score": 0.72, "why": "Transaction throughput rose sharply compared with the recent baseline."},
-            {"cause": "batch_job_or_benchmark_started", "score": 0.55 if active >= 8 else 0.35, "why": "A sudden throughput rise often maps to a benchmark, batch job, or application traffic burst."},
-        ]
-    if kind == "throughput_drop":
-        return [
-            {"cause": "workload_stopped_or_client_backoff", "score": 0.68, "why": "Transaction throughput fell sharply compared with the recent baseline."},
-            {"cause": "resource_contention_or_blocking", "score": 0.6 if waiting or read_time >= 50 else 0.36, "why": "A throughput drop can also be caused by waits, IO pressure, locks, or maintenance work."},
-        ]
-    if kind == "ml_suspicious_activity":
-        return [
-            {"cause": "compound_workload_or_resource_shift", "score": 0.7, "why": "The ML detector combined workload transition, concurrency, wait, IO, and maintenance features."},
-            {"cause": "dba_or_maintenance_induced_degradation", "score": round(max(vacuum_elapsed / 30, read_time / 50), 2), "why": "Maintenance and IO features contribute to the anomaly score when they move with workload signals."},
-        ]
-    return [
-        {"cause": "storage_or_cache_pressure", "score": 0.78 if read_time >= 50 else 0.4, "why": "Read timing rose together with database IO counters."},
-        {"cause": "working_set_shift", "score": 0.49 if read_blocks > 0 else 0.28, "why": "A larger working set can reduce cache locality and increase physical reads."},
-    ]
-
-
-def build_causal_chain(signal: dict[str, Any]) -> list[dict[str, str]]:
-    comparator = signal.get("operator") or ("<=" if signal["type"].endswith("_drop") else ">=")
-    return [
-        {"stage": "symptom", "label": signal["metric"], "detail": f"{signal['value']} {comparator} {signal['threshold']}"},
-        {"stage": "candidate cause", "label": signal["candidate_root"], "detail": "ranked from current evidence"},
-        {"stage": "impact", "label": signal["type"], "detail": signal["summary"]},
-    ]
-
-
 def build_investigation(signal: dict[str, Any], sample_count: int = 1) -> dict[str, Any]:
     progress = min(88, 18 + sample_count * 12)
     if sample_count <= 1:
         phase = "collecting_evidence"
         summary = "Collecting telemetry around the anomaly window."
     elif sample_count <= 3:
-        phase = "ranking_hypotheses"
-        summary = "Ranking competing root-cause hypotheses from current evidence."
+        phase = "building_context"
+        summary = "Building incident context for root-cause analysis."
     else:
-        phase = "awaiting_feedback"
-        summary = "Causal explanation is ready for operator review."
+        phase = "ready_for_ai"
+        summary = "Incident context is ready for AI root-cause analysis."
     return {
-        "state": "running" if phase != "awaiting_feedback" else "needs_review",
+        "state": "running" if phase != "ready_for_ai" else "ready",
         "phase": phase,
         "progress": progress,
-        "engine": {"mode": "hybrid inference", "current": "rules, graph scoring, and ML suspicious-activity scoring"},
         "summary": summary,
         "started_at": signal["t"],
         "updated_at": signal["t"],
         "steps": [
             {"id": "capture_window", "label": "Capture anomaly window", "status": "done", "detail": f"{signal['metric']} crossed {signal['threshold']}."},
             {"id": "collect_evidence", "label": "Collect supporting and negative evidence", "status": "running" if sample_count <= 1 else "done", "detail": "Read active sessions, waits, IO timing, throughput, and contextual counters."},
-            {"id": "rank_hypotheses", "label": "Run causal inference", "status": "pending" if sample_count <= 1 else "running" if sample_count <= 3 else "done", "detail": "Rank hypotheses from detector signals, graph context, and current evidence."},
-            {"id": "operator_review", "label": "Wait for operator review", "status": "pending" if sample_count <= 3 else "running", "detail": "Confirm, reject, or enrich the proposed explanation."},
-        ],
-        "next_actions": [
-            "Open related query fingerprints.",
-            "Compare baseline versus incident window.",
-            "Collect lock/wait-event breakdown before final root-cause confirmation.",
+            {"id": "prepare_ai_context", "label": "Prepare AI context", "status": "pending" if sample_count <= 1 else "running" if sample_count <= 3 else "done", "detail": "Package telemetry, DBA events, detector evidence, and MCP access for investigation."},
+            {"id": "ai_investigation", "label": "AI investigation", "status": "pending", "detail": "Start the AI agent to inspect tools and produce root-cause verdict."},
         ],
     }
 
 
 def enrich_signal(signal: dict[str, Any], point: dict[str, float]) -> dict[str, Any]:
-    signal["hypotheses"] = signal.get("hypotheses") or build_hypotheses(signal, point)
-    signal["causal_chain"] = signal.get("causal_chain") or build_causal_chain(signal)
     return signal
 
 
@@ -347,10 +285,6 @@ class MLBasedSuspicionDetector:
             "detector": self.describe(),
             "model": {"kind": "hybrid_anomaly_model", "version": "0", "signal_contract": SIGNAL_CONTRACT},
             "evidence": [{"metric": name, "value": value, "role": "ml_feature"} for name, value in features.items()],
-            "hypotheses": [
-                {"cause": "compound_workload_or_resource_shift", "score": score, "why": "Several weak signals jointly look suspicious even when a single threshold is not decisive."},
-                {"cause": "dba_or_maintenance_induced_degradation", "score": round(max(features["vacuum_pressure"], features["io_pressure"]), 2), "why": "Maintenance and IO features contribute to the anomaly score."},
-            ],
         }
         return [enrich_signal(signal, point)]
 

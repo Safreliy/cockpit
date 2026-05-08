@@ -68,11 +68,12 @@ services:
       PGDATABASE: cockpit
       PGUSER: cockpit
       PGPASSWORD: cockpit
+      COCKPIT_PERSISTENCE: ${COCKPIT_PERSISTENCE:-postgres}
       AI_AGENT_BASE_URL: ${AI_AGENT_BASE_URL:-}
       AI_AGENT_USER_ID: ${AI_AGENT_USER_ID:-00000000-0000-4000-8000-000000000001}
       AI_AGENT_SOURCE: ${AI_AGENT_SOURCE:-web}
       AI_AGENT_MODEL_ID: ${AI_AGENT_MODEL_ID:-}
-      AI_AGENT_MCP_URL: ${AI_AGENT_MCP_URL:-}
+      AI_AGENT_MCP_URL: ${AI_AGENT_MCP_URL:-http://host.docker.internal:8090/mcp}
       AI_AGENT_MCP_IDS: ${AI_AGENT_MCP_IDS:-}
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
@@ -84,8 +85,36 @@ services:
         condition: service_healthy
       prometheus:
         condition: service_started
+      cockpit_mcp:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "python3 - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8088/api/snapshot', timeout=2).read()\nPY"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  cockpit_mcp:
+    build:
+      context: ..
+      dockerfile: Dockerfile.mcp
+    container_name: cockpit-mcp
+    environment:
+      PROMETHEUS_URL: http://prometheus:9090
+      COCKPIT_BACKEND_URL: http://cockpit_backend:8088
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: cockpit
+      PGUSER: cockpit
+      PGPASSWORD: cockpit
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()\nPY"]
       interval: 10s
       timeout: 5s
       retries: 12

@@ -45,10 +45,19 @@ def compact_incident_context(incident: dict[str, Any], stream: list[dict[str, fl
         },
         "detector": incident.get("detector"),
         "evidence": incident.get("evidence", [])[-20:],
-        "hypotheses": incident.get("hypotheses", [])[:8],
-        "causal_chain": incident.get("causal_chain", []),
         "signal_timeline": incident.get("timeline", [])[-30:],
         "operational_events": incident.get("operational_events", [])[-20:],
+        "dashboard_visual_context": incident.get("dashboard_visual_context"),
+        "visual_input_status": incident.get("visual_input_status"),
+        "attached_visual_inputs": [
+            {
+                "type": item.get("type"),
+                "source": item.get("source"),
+                "captured_at": item.get("captured_at"),
+                "detail": item.get("detail"),
+            }
+            for item in incident.get("image_attachments", [])
+        ],
         "settings": settings,
         "telemetry_window": window,
     }
@@ -58,13 +67,22 @@ def build_investigation_prompt(context: dict[str, Any]) -> str:
     return (
         "You are an AI incident investigator for a PostgreSQL observability cockpit.\n"
         "Investigate the incident using the supplied detector evidence, telemetry window, DBA events, and available MCP tools.\n"
-        "If MCP tools are available, use them to inspect the incident context before the final answer.\n"
+        "The request may include attached dashboard chart images. If images are attached, inspect them as visual telemetry evidence: "
+        "look for timing, trend shape, spikes, drops, recovery, and whether the visual chart supports or contradicts the textual metrics.\n"
+        "If attached_visual_inputs is not empty, visual_observations MUST contain at least one concrete item. "
+        "If you cannot inspect the image, say that explicitly in visual_observations instead of leaving it empty.\n"
+        "If MCP tools are available, use them to inspect the incident context before the final answer. "
+        "For query-level causes, prefer checking get_pg_stat_statements_status and get_query_fingerprints "
+        "before asking for pg_stat_statements data. If the incident has started_at/last_seen_at timestamps, "
+        "prefer get_query_fingerprint_window(start_epoch, end_epoch) for windowed deltas. Use sort_by values "
+        "such as total_exec_time, calls, shared_blks_read, temp_blks_written, or wal_bytes when relevant.\n"
         "Return ONLY valid JSON with this schema:\n"
         "{\n"
         '  "verdict": "short root-cause verdict",\n'
         '  "confidence": 0.0,\n'
         '  "root_cause": "specific suspected root cause",\n'
         '  "causal_chain": [{"stage": "symptom|cause|impact|evidence", "detail": "..."}],\n'
+        '  "visual_observations": ["what the attached chart image shows, or why it was not useful"],\n'
         '  "supporting_evidence": ["..."],\n'
         '  "negative_evidence": ["..."],\n'
         '  "recommended_actions": ["..."],\n'
@@ -93,6 +111,7 @@ def parse_agent_verdict(content: str) -> dict[str, Any]:
     verdict.setdefault("confidence", 0)
     verdict.setdefault("supporting_evidence", [])
     verdict.setdefault("negative_evidence", [])
+    verdict.setdefault("visual_observations", [])
     verdict.setdefault("recommended_actions", [])
     verdict.setdefault("needs_more_data", [])
     return verdict
@@ -184,10 +203,44 @@ class WhatareyatalkinaboutClient:
         }
         return str(self._request("POST", "/api/v1/chats", payload).get("data", {})["id"])
 
-    def complete(self, chat_id: str, prompt: str) -> tuple[str, dict[str, Any]]:
-        response = self._request("POST", f"/api/v1/chats/{chat_id}/completion", {"message": prompt})
+    def complete(self, chat_id: str, prompt: str, attachments: list[dict[str, Any]] | None = None) -> tuple[str, dict[str, Any]]:
+        payload: dict[str, Any] = {"message": prompt}
+        if attachments:
+            payload["attachments"] = attachments
+        response = self._request("POST", f"/api/v1/chats/{chat_id}/completion", payload)
         data = response.get("data", {})
         return str(data.get("message", {}).get("content", "")), data.get("usage", {})
+
+    def get_messages(self, chat_id: str) -> list[dict[str, Any]]:
+        response = self._request("GET", f"/api/v1/chats/{chat_id}/messages")
+        data = response.get("data", [])
+        return data if isinstance(data, list) else []
+
+    def stream_completion_lines(self, chat_id: str, prompt: str) -> Any:
+        payload = {"message": prompt}
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "X-User-ID": self.user_id,
+            "X-Source": self.source,
+        }
+        request = urllib.request.Request(
+            self.base_url + f"/api/v1/chats/{chat_id}/completion/stream",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=self.timeout)
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise AIAgentError(f"AI agent HTTP {error.code}: {detail}") from error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise AIAgentError(f"AI agent unavailable: {error}") from error
+        with response:
+            for raw_line in response:
+                yield raw_line.decode("utf-8", errors="replace")
 
 
 def run_ai_investigation(
@@ -203,7 +256,11 @@ def run_ai_investigation(
     mcp_ids = session.get("mcp_ids") or agent.ensure_mcp_ids()
     chat_id = session.get("chat_id") or agent.create_chat(str(incident["id"]), model_id, mcp_ids)
     context = compact_incident_context(incident, stream, settings)
-    content, usage = agent.complete(chat_id, build_investigation_prompt(context))
+    content, usage = agent.complete(
+        chat_id,
+        build_investigation_prompt(context),
+        attachments=incident.get("image_attachments") or None,
+    )
     verdict = parse_agent_verdict(content)
     now = int(time.time())
     return {

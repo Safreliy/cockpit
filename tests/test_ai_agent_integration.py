@@ -20,6 +20,7 @@ class FakeAgentClient:
     def __init__(self):
         self.created_chat = None
         self.prompt = ""
+        self.attachments = None
 
     def ensure_model(self):
         return "model-1"
@@ -35,8 +36,9 @@ class FakeAgentClient:
         }
         return "chat-1"
 
-    def complete(self, chat_id, prompt):
+    def complete(self, chat_id, prompt, attachments=None):
         self.prompt = prompt
+        self.attachments = attachments
         return (
             '{"verdict":"lock contention from workload","confidence":0.82,'
             '"root_cause":"blocked updates","causal_chain":[{"stage":"cause","detail":"row lock waits"}],'
@@ -87,13 +89,19 @@ def sample_incident():
 
 
 def test_ai_prompt_contains_compact_incident_context():
+    incident = sample_incident()
+    incident["image_attachments"] = [{"type": "image_url", "source": "dashboard_chart", "captured_at": 100, "detail": "high"}]
     context = compact_incident_context(
-        sample_incident(),
+        incident,
         [{"t": 90.0, "waiting_connections": 0.0}, {"t": 101.0, "waiting_connections": 3.0}],
         {"work_mem": {"setting": "4096", "unit": "kB"}},
     )
     prompt = build_investigation_prompt(context)
     assert "PostgreSQL observability cockpit" in prompt
+    assert "dashboard chart images" in prompt
+    assert "visual_observations" in prompt
+    assert "attached_visual_inputs" in prompt
+    assert "MUST contain at least one concrete item" in prompt
     assert "inc-wait-1" in prompt
     assert "waiting_connections" in prompt
     assert "Return ONLY valid JSON" in prompt
@@ -107,6 +115,7 @@ def test_parse_agent_verdict_accepts_json_fenced_response():
     assert verdict["confidence"] == 0.71
     assert verdict["recommended_actions"] == ["rollback"]
     assert verdict["supporting_evidence"] == []
+    assert verdict["visual_observations"] == []
 
 
 def test_whatarey_client_can_create_model_using_agent_backend_global_llm(monkeypatch):
@@ -131,6 +140,14 @@ def test_run_ai_investigation_creates_session_and_returns_verdict():
     assert result["verdict"]["root_cause"] == "blocked updates"
     assert fake.created_chat["incident_id"] == "inc-wait-1"
     assert "Incident context JSON" in fake.prompt
+
+
+def test_run_ai_investigation_passes_image_attachments():
+    fake = FakeAgentClient()
+    incident = sample_incident()
+    incident["image_attachments"] = [{"type": "image_url", "image_url": "data:image/png;base64,abc", "detail": "high"}]
+    run_ai_investigation(incident, [{"t": 100.0, "waiting_connections": 3.0}], {}, client=fake)
+    assert fake.attachments == incident["image_attachments"]
 
 
 def test_backend_ai_investigation_updates_incident_verdict():
@@ -177,3 +194,93 @@ def test_backend_ai_investigation_updates_incident_verdict():
     updated = store.get_incident(incident_id)
     assert updated["ai_verdict"]["verdict"] == "Lock contention"
     assert updated["investigation"]["phase"] == "ai_verdict_ready"
+
+
+def test_backend_ai_investigation_attaches_dashboard_image():
+    store = TelemetryStore()
+    store.add_point(
+        {
+            "t": 100.0,
+            "active_connections": 1.0,
+            "waiting_connections": 3.0,
+            "blk_read_time_ms_rate": 0.0,
+            "vacuum_max_elapsed_seconds": 0.0,
+            "xact_rate": 10.0,
+        }
+    )
+    incident_id = store.incidents[0]["id"]
+
+    def fake_run(incident, stream, settings, existing_session=None):
+        assert incident["image_attachments"][0]["image_url"] == "data:image/png;base64,abc"
+        assert incident["visual_input_status"]["accepted"] == 1
+        assert incident["dashboard_visual_context"]["image_attached"] is True
+        return {"status": "complete", "updated_at": int(time.time()), "verdict": {"verdict": "Image used"}}
+
+    with patch("cockpit_backend.run_ai_investigation", side_effect=fake_run):
+        ok, message, incident = store.start_ai_investigation(
+            incident_id,
+            [{"type": "image_url", "image_url": "data:image/png;base64,abc", "detail": "high"}],
+        )
+        assert ok is True
+        assert message == "started"
+        assert incident["image_attachments"][0]["source"] == "dashboard_chart"
+        assert incident["visual_input_status"]["attached_to_agent_request"] is True
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            updated = store.get_incident(incident_id)
+            if updated and updated.get("ai_investigation", {}).get("status") == "complete":
+                break
+            time.sleep(0.02)
+
+    updated = store.get_incident(incident_id)
+    assert updated["ai_verdict"]["verdict"] == "Image used"
+
+
+def test_backend_ai_healthcheck_creates_incident_with_dashboard_context():
+    store = TelemetryStore()
+    store.add_point(
+        {
+            "t": 100.0,
+            "active_connections": 1.0,
+            "waiting_connections": 0.0,
+            "blk_read_time_ms_rate": 0.0,
+            "vacuum_max_elapsed_seconds": 0.0,
+            "xact_rate": 10.0,
+        }
+    )
+
+    def fake_run(incident, stream, settings, existing_session=None):
+        assert incident["type"] == "ai_healthcheck"
+        assert incident["dashboard_visual_context"]["kind"] == "dashboard_textual_surrogate"
+        assert incident["dashboard_visual_context"]["image_attached"] is True
+        assert incident["image_attachments"][0]["image_url"].startswith("data:image/png")
+        assert incident["visual_input_status"]["accepted"] == 1
+        return {
+            "status": "complete",
+            "chat_id": "chat-health",
+            "model_id": "model-1",
+            "mcp_ids": ["mcp-1"],
+            "updated_at": int(time.time()),
+            "usage": {"tokens_in": 1, "tokens_out": 1},
+            "verdict": {
+                "verdict": "Cockpit state looks healthy",
+                "confidence": 0.74,
+                "root_cause": "no active incident pattern",
+            },
+        }
+
+    with patch("cockpit_backend.run_ai_investigation", side_effect=fake_run):
+        ok, message, incident = store.start_ai_healthcheck(
+            [{"type": "image_url", "image_url": "data:image/png;base64,abc", "detail": "high"}]
+        )
+        assert ok is True
+        assert message == "started"
+        assert incident["type"] == "ai_healthcheck"
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            updated = store.get_incident(incident["id"])
+            if updated and updated.get("ai_investigation", {}).get("status") == "complete":
+                break
+            time.sleep(0.02)
+    updated = store.get_incident(incident["id"])
+    assert updated["ai_verdict"]["verdict"] == "Cockpit state looks healthy"

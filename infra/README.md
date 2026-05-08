@@ -8,6 +8,7 @@ This stack is the first step from simulation toward real telemetry.
 - postgres_exporter on `localhost:9187`
 - Prometheus on `localhost:9090`
 - Cockpit backend and live UI on `localhost:8088`
+- Cockpit MCP server on `localhost:8090`
 
 ## Start
 
@@ -61,7 +62,18 @@ The backend:
 - streams telemetry and detections to the browser over Server-Sent Events;
 - exposes `POST /api/load/start` and `POST /api/load/stop`;
 - starts `pgbench` from the backend container against the Postgres service;
-- keeps only a rolling in-memory telemetry window.
+- keeps only a rolling in-memory telemetry window;
+- persists compact signal, incident, and AI verdict records in PostgreSQL.
+
+The MCP server exposes read-only investigation tools for the AI agent:
+
+- compact cockpit snapshot and incident lookup;
+- Prometheus metric windows;
+- PostgreSQL settings;
+- wait-event breakdown, locks, current activity, pg_stat_statements status, sortable query fingerprints, queryid detail, and windowed fingerprint deltas from persisted snapshots;
+- bounded read-only SQL for hypothesis checks.
+
+If `whatareyatalkinabout` runs in Docker and registers `http://host.docker.internal:8090/mcp`, its local `.env` needs `URL_SSRF_PROTECTION=False`; otherwise the agent service rejects private MCP URLs. Do this only for the local sandbox.
 
 Manual host mode is still available for debugging:
 
@@ -71,12 +83,13 @@ python tools/cockpit_backend.py
 
 ## Retention Policy
 
-For local development we use bounded retention at two layers:
+For local development we use bounded retention at three layers:
 
 - Prometheus TSDB retention is set to `2d` in `docker-compose.yml`.
 - The cockpit backend keeps a rolling in-memory buffer: 720 telemetry points and 200 detections by default.
+- PostgreSQL stores compact incident-domain records in `cockpit_signals`, `cockpit_incidents`, and `cockpit_ai_verdicts`; raw telemetry remains in Prometheus only.
 
-At the default 2 second polling interval, 720 points is about 24 minutes of UI history. The backend does not append telemetry to disk. If we later persist incidents, we should store compact episode records, not raw high-cardinality telemetry.
+At the default 2 second polling interval, 720 points is about 24 minutes of UI history. The backend does not append raw telemetry to disk.
 
 ## Stop
 
